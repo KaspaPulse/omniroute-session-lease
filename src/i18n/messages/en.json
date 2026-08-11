@@ -4671,7 +4671,7 @@
     "primaryKey": "Primary Key",
     "apiKeyInvalidAlert": "{count} API key(s) marked as invalid due to authentication failures in connections: {connections}. They will be skipped in rotation. Click to review.",
     "apiKeyInvalidAlertTitle": "API Key Health Alert",
-    "apiKeyWarningAlert": "{count} API key(s) in warning state due to elevated failure rate in connections: {connections}. Review to prevent rotation issues.",
+    "apiKeyWarningAlert": "{count} API key(s) recorded an authentication failure in connections: {connections}. A successful authenticated response clears this warning automatically; review repeated failures to prevent rotation issues.",
     "apiKeyWarningAlertTitle": "API Key Warning",
     "googlePseInfo": "Google Pse Info",
     "antigravityProjectIdHint": "Optional override for Antigravity Cloud Code requests. Leave blank to use the project discovered during Google OAuth.",

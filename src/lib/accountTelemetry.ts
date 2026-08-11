@@ -42,6 +42,8 @@ export interface AccountTelemetry {
   lastProbeAt: string | null;
   lastProbeOutcome: "SUCCESS" | "FAILURE" | "UNKNOWN";
   probeLatencyMs: number | null;
+  sourceTimestamp: string | null;
+  sourceAgeMs: number | null;
   stale: boolean;
   ageMs: number | null;
   disabledReason: string | null;
@@ -62,6 +64,7 @@ export interface ExternalAccountTelemetryInput {
   lastProbeAt?: string | null;
   lastProbeOutcome?: "SUCCESS" | "FAILURE" | "UNKNOWN";
   probeLatencyMs?: number | null;
+  sourceTimestamp?: string | null;
 }
 
 export interface ProviderAccountTelemetry {
@@ -144,7 +147,9 @@ export function projectExternalAccountTelemetry(
   const quotaObservedMs = timestampMs(input.quotaObservedAt);
   const probeMs = timestampMs(input.lastProbeAt) ?? quotaObservedMs;
   const ageMs = probeMs === null ? null : Math.max(0, now - probeMs);
-  const stale = ageMs === null || ageMs > staleAfterMs;
+  const sourceMs = timestampMs(input.sourceTimestamp) ?? probeMs;
+  const sourceAgeMs = sourceMs === null ? null : Math.max(0, now - sourceMs);
+  const stale = sourceAgeMs === null || sourceAgeMs > staleAfterMs;
   const quotaAvailable =
     input.quotaRemainingPercent === null || input.quotaRemainingPercent === undefined
       ? null
@@ -185,6 +190,8 @@ export function projectExternalAccountTelemetry(
     lastProbeAt: probeMs === null ? null : new Date(probeMs).toISOString(),
     lastProbeOutcome: input.lastProbeOutcome || "UNKNOWN",
     probeLatencyMs: numberOrNull(input.probeLatencyMs),
+    sourceTimestamp: sourceMs === null ? null : new Date(sourceMs).toISOString(),
+    sourceAgeMs,
     stale,
     ageMs,
     disabledReason: input.enabled === false ? "administratively_disabled" : null,
@@ -312,7 +319,13 @@ export async function projectProviderAccountTelemetry(
         timestampMs(connection.lastHealthCheckAt) ??
         quota.fetchedAt;
       const ageMs = probeAt === null ? null : Math.max(0, now - probeAt);
-      const stale = ageMs === null || ageMs > staleAfterMs;
+      // This function has just read the same provider_connections row consumed
+      // by getProviderCredentials(). Its observation time is authoritative for
+      // persisted router state; an older optional probe timestamp remains useful
+      // metadata but must not overwrite current router truth.
+      const sourceTimestamp = now;
+      const sourceAgeMs = 0;
+      const stale = false;
       const baseState = deriveAccountTelemetryState({
         enabled: connection.isActive === true,
         status,
@@ -372,6 +385,8 @@ export async function projectProviderAccountTelemetry(
               ? "UNKNOWN"
               : "FAILURE",
         probeLatencyMs: null,
+        sourceTimestamp: new Date(sourceTimestamp).toISOString(),
+        sourceAgeMs,
         stale,
         ageMs,
         disabledReason: connection.isActive === true ? null : "administratively_disabled",

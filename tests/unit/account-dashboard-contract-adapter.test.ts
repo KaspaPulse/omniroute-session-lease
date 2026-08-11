@@ -93,3 +93,42 @@ test("passed reset remains fail-closed until a newer live observation validates 
   assert.equal(result.quota.validationRequired, true);
   assert.equal(result.routingEligible, false);
 });
+
+test("fresh source generation keeps router-ready state from inheriting an old probe timestamp", () => {
+  const result = projectLegacyDashboardState(
+    {
+      generated_at: "2026-08-11T07:59:50.000Z",
+      accounts: {
+        "chatgpt-pro-primary": {
+          ...common,
+          status: "ready",
+          real_smoke: {
+            ...common.real_smoke,
+            tested_at: "2026-08-11T07:00:00.000Z",
+          },
+        },
+      },
+    },
+    { now }
+  );
+
+  assert.equal(result.accounts[0].state, "READY");
+  assert.equal(result.accounts[0].routingEligible, true);
+  assert.equal(result.accounts[0].stale, false);
+  assert.equal(result.accounts[0].sourceTimestamp, "2026-08-11T07:59:50.000Z");
+  assert.equal(result.accounts[0].sourceAgeMs, 10_000);
+  assert.ok((result.accounts[0].ageMs ?? 0) > result.staleAfterMs);
+});
+
+test("stale source generation remains UNKNOWN even when copied account status says ready", () => {
+  const result = projectLegacyDashboardState(
+    {
+      generated_at: "2026-08-11T07:00:00.000Z",
+      accounts: { "chatgpt-plus-humoud19802": { ...common, status: "ready" } },
+    },
+    { now }
+  );
+  assert.equal(result.accounts[0].state, "UNKNOWN");
+  assert.equal(result.accounts[0].routingEligible, false);
+  assert.equal(result.accounts[0].stale, true);
+});

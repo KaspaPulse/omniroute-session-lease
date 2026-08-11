@@ -2402,8 +2402,11 @@ export async function handleChatCore({
                 stage: "provider_response_started",
               });
 
-              if (res.response.status === 401 && execCreds?.connectionId) {
-                recordKeyHealthStatus(401, execCreds);
+              // Account for each completed upstream authentication attempt exactly
+              // once. Recording here also lets successful streaming responses
+              // recover stale warning state before the stream later drains/cancels.
+              if (execCreds?.connectionId) {
+                recordKeyHealthStatus(res.response.status, execCreds);
               }
 
               // Qwen 429 strict quota backoff (wait 1.5s, 3s and retry)
@@ -2718,13 +2721,6 @@ export async function handleChatCore({
         // Non-stream: release semaphore immediately after reading full response body.
         const status = rawResult.response.status;
 
-        // Use execution credentials captured during request processing
-        if (
-          rawResult._executionCredentials?.connectionId &&
-          rawResult._executionCredentials?.apiKey
-        ) {
-          recordKeyHealthStatus(status, rawResult._executionCredentials);
-        }
         releaseRawResultAccountSemaphore =
           typeof rawResult._accountSemaphoreRelease === "function"
             ? rawResult._accountSemaphoreRelease

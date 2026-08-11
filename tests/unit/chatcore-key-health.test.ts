@@ -7,6 +7,9 @@
 // byte-identically and is fire-and-forget; these tests assert the synchronous health mutations.
 import { test, afterEach } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { recordKeyHealthStatus } from "../../open-sse/handlers/chatCore/keyHealth.ts";
 import { getAllKeyHealth, removeConnectionHealth } from "../../open-sse/services/apiKeyRotator.ts";
 
@@ -55,6 +58,14 @@ test("2xx after a failure resets the key to active with 0 failures", () => {
   assert.equal(h?.status, "active");
 });
 
+test("403, cancellation, quota, and provider failures do not poison API-key health", () => {
+  for (const status of [403, 408, 429, 499, 500, 502, 503, 504]) {
+    const conn = `kh-nonauth-${status}`;
+    recordKeyHealthStatus(status, creds(conn), noopLog);
+    assert.equal(getAllKeyHealth()[`${conn}:primary`], undefined);
+  }
+});
+
 test("honors selectedKeyId — scopes the update to the active extra key, not primary", () => {
   const conn = "kh-selected-key";
   recordKeyHealthStatus(401, creds(conn, { selectedKeyId: "extra_1" }), noopLog);
@@ -67,4 +78,16 @@ test("non-401 / non-2xx status does not touch key health", () => {
   const conn = "kh-5xx-noop";
   recordKeyHealthStatus(500, creds(conn), noopLog);
   assert.equal(getAllKeyHealth()[`${conn}:primary`], undefined);
+});
+
+test("chatCore records key health once at the shared upstream-response boundary", () => {
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const source = fs.readFileSync(path.resolve(here, "../../open-sse/handlers/chatCore.ts"), "utf8");
+  const call = "recordKeyHealthStatus(res.response.status, execCreds);";
+  assert.equal(source.split(call).length - 1, 1);
+  assert.ok(source.indexOf(call) < source.indexOf("if (stream) {"));
+  assert.doesNotMatch(
+    source,
+    /recordKeyHealthStatus\(status,\s*rawResult\._executionCredentials\)/
+  );
 });

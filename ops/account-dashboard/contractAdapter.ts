@@ -68,7 +68,7 @@ function legacyProbeOutcome(account: JsonRecord): "SUCCESS" | "FAILURE" | "UNKNO
 export function projectLegacyDashboardAccount(
   connectionName: string,
   account: JsonRecord,
-  options: { now?: number; staleAfterMs?: number } = {}
+  options: { now?: number; staleAfterMs?: number; sourceTimestamp?: string | null } = {}
 ): AccountTelemetry {
   const legacyStatus = String(account.status || "unknown")
     .trim()
@@ -97,6 +97,7 @@ export function projectLegacyDashboardAccount(
         null,
       lastProbeOutcome: legacyProbeOutcome(account),
       probeLatencyMs: numberValue(record(account.real_smoke).latency_ms),
+      sourceTimestamp: options.sourceTimestamp,
     },
     options
   );
@@ -163,7 +164,12 @@ export function projectLegacyDashboardState(
 ): ProviderAccountTelemetry {
   const now = options.now ?? Date.now();
   const accounts = Object.entries(state.accounts || {})
-    .map(([connectionName, value]) => projectLegacyDashboardAccount(connectionName, value, options))
+    .map(([connectionName, value]) =>
+      projectLegacyDashboardAccount(connectionName, value, {
+        ...options,
+        sourceTimestamp: stringValue(state.generated_at) || null,
+      })
+    )
     .sort((a, b) => a.displayName.localeCompare(b.displayName));
 
   return {

@@ -65,6 +65,8 @@ test("READY is visible, eligible, safe to serialize, and telemetry reads have ze
 
   assert.equal(projection.accounts[0].state, "READY");
   assert.equal(projection.accounts[0].routingEligible, true);
+  assert.equal(projection.accounts[0].sourceAgeMs, 0);
+  assert.equal(projection.accounts[0].stale, false);
   assert.equal(projection.summary.READY, 1);
   assert.equal(projection.summary.routingEligible, 1);
   assert.equal(JSON.stringify(usage.getPendingRequests()), beforePending);
@@ -307,4 +309,18 @@ test("external telemetry masks email display names", () => {
   );
   assert.equal(projected.displayName, "pr***@example.test");
   assert.doesNotMatch(JSON.stringify(projected), /private\.person/);
+});
+
+test("fresh router-row timestamp prevents an old optional probe from forcing UNKNOWN", async () => {
+  const now = Date.now();
+  await createConnection({
+    name: "chatgpt-plus-humoud19802",
+    lastTested: "2026-08-01T00:00:00.000Z",
+    testStatus: "active",
+  });
+  const projection = await telemetry.projectProviderAccountTelemetry("codex", { now });
+  assert.equal(projection.accounts[0].state, "READY");
+  assert.equal(projection.accounts[0].routingEligible, true);
+  assert.ok((projection.accounts[0].sourceAgeMs ?? Number.POSITIVE_INFINITY) < 5_000);
+  assert.ok((projection.accounts[0].ageMs ?? 0) > projection.staleAfterMs);
 });
