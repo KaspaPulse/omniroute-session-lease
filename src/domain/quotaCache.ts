@@ -73,21 +73,24 @@ function isExhausted(quotas: Record<string, QuotaInfo>): boolean {
 }
 
 /**
- * T08 — Auto-advance quota window.
- * If we know the window duration, advance past the expired window(s) to
- * avoid blocking requests when the quota reset already happened but the
- * background refresh hasn't run yet.
+ * Identify an exhausted observation whose advertised reset deadline passed.
+ * Elapsed time alone is not a successful upstream observation, so callers keep
+ * the account fail-closed until a newer quota snapshot validates recovery.
  */
-function advancedWindowResetAt(entry: QuotaCacheEntry, now: number): { exhausted: false } | null {
+function advancedWindowResetAt(
+  entry: QuotaCacheEntry,
+  now: number
+): { validationRequired: true } | null {
   if (!entry.nextResetAt) return null;
 
   const resetMs = parseDate(entry.nextResetAt);
   if (resetMs === null) return null;
 
-  // If the window's resetAt is in the past, the quota has been renewed.
-  // Eagerly mark as available so requests don't wait for the 5-min TTL.
+  // A reset deadline passing makes the old observation stale; it does not prove
+  // that the upstream account recovered. Keep it fail-closed until a newer live
+  // usage observation validates the new window.
   if (resetMs <= now) {
-    return { exhausted: false };
+    return { validationRequired: true };
   }
 
   return null;
@@ -231,18 +234,21 @@ export function isQuotaExhaustedForRequest(
 export function setQuotaCache(
   connectionId: string,
   provider: string,
-  rawQuotas: Record<string, any>
+  rawQuotas: Record<string, any>,
+  observedAt: number = Date.now()
 ) {
+  const prior = cache.get(connectionId);
+  if (prior && observedAt < prior.fetchedAt) return false;
+
   const quotas = normalizeQuotas(rawQuotas);
   const exhausted = isExhausted(quotas);
   // #4438 — capture the prior entry BEFORE overwriting the cache so we can skip
   // redundant snapshot writes for idle connections whose quota didn't change.
-  const prior = cache.get(connectionId);
   const entry: QuotaCacheEntry = {
     connectionId,
     provider,
     quotas,
-    fetchedAt: Date.now(),
+    fetchedAt: observedAt,
     exhausted,
     nextResetAt: exhausted ? earliestResetAt(quotas) : null,
   };
@@ -292,6 +298,7 @@ export function setQuotaCache(
       }
     }
   }
+  return true;
 }
 
 /**
@@ -373,14 +380,11 @@ export function isAccountQuotaExhausted(connectionId: string): boolean {
 
   const now = Date.now();
 
-  // T08 — Auto window advance: if resetAt is in the past, eagerly treat as not exhausted.
-  // This prevents stale exhaustion blocking when background refresh hasn't run yet.
+  // Passing resetAt requires a newer provider observation. Dashboard reads and
+  // elapsed time alone never make an exhausted account routing-eligible.
   const advanced = advancedWindowResetAt(entry, now);
   if (advanced) {
-    // Optimistically clear the exhausted flag so we unblock requests immediately.
-    // The next background refresh will update with the real quota state.
-    entry.exhausted = false;
-    return false;
+    return true;
   }
 
   // Exhausted entries without resetAt expire after fixed TTL
@@ -410,13 +414,19 @@ export function getQuotaWindowStatus(
   const remainingPercentage = clampPercent(window.remainingPercentage);
   const usedPercentage = clampPercent(100 - remainingPercentage);
 
-  let resetAt = window.resetAt || null;
-  let windowExpired = false;
+  const resetAt = window.resetAt || null;
   if (resetAt) {
     const resetMs = parseDate(resetAt);
     if (resetMs !== null && resetMs <= now) {
-      resetAt = null;
-      windowExpired = true;
+      // Preserve a fully exhausted observation after its deadline. A background
+      // or request-time provider refresh must replace it before routing reopens.
+      // Non-exhausted percentages retain the prior rolling-window behavior.
+      return {
+        remainingPercentage,
+        usedPercentage,
+        resetAt: remainingPercentage <= 0 ? resetAt : null,
+        reachedThreshold: remainingPercentage <= 0,
+      };
     }
   }
 
@@ -424,8 +434,7 @@ export function getQuotaWindowStatus(
     remainingPercentage,
     usedPercentage,
     resetAt,
-    // If reset time has already passed, avoid stale cached percentages blocking selection.
-    reachedThreshold: windowExpired ? false : usedPercentage >= thresholdPercent,
+    reachedThreshold: usedPercentage >= thresholdPercent,
   };
 }
 

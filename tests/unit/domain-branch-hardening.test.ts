@@ -319,7 +319,11 @@ test("quotaCache covers normalized windows, stale exhaustion, stats and refresh 
   assert.equal(quotaCache.isAccountQuotaExhausted(exhaustedWithResetId), true);
 
   now += 61_000;
-  assert.equal(quotaCache.isAccountQuotaExhausted(exhaustedWithResetId), false);
+  assert.equal(
+    quotaCache.isAccountQuotaExhausted(exhaustedWithResetId),
+    true,
+    "elapsed reset time requires a newer provider validation"
+  );
 
   const exhausted429Id = "quota-exhausted-429";
   quotaCache.markAccountExhaustedFrom429(exhausted429Id, "cursor");

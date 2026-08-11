@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { useTranslations } from "next-intl";
 import { Handle, Position, type Node, type Edge, type NodeTypes } from "@xyflow/react";
 import { AI_PROVIDERS } from "@/shared/constants/providers";
@@ -8,6 +8,7 @@ import ProviderIcon from "@/shared/components/ProviderIcon";
 import { FlowCanvas } from "@/shared/components/flow/FlowCanvas";
 import { StatusDot } from "@/shared/components/flow/StatusDot";
 import { edgeStyle } from "@/shared/components/flow/edgeStyles";
+import type { ProviderAccountTelemetry } from "@/lib/accountTelemetry";
 import { resolveTopologyNodeLabel } from "./topologyLabel";
 
 // Rings: [capacity, rx, ry]. Each successive ring fits ~6 more nodes.
@@ -37,10 +38,12 @@ type ProviderNodeData = {
   providerId: string;
   active: boolean;
   error: boolean;
+  accountPool: ProviderAccountTelemetry | null;
 };
 
 function ProviderNode({ data }: { data: ProviderNodeData }) {
-  const { label, color, providerId, active, error } = data;
+  const { label, color, providerId, active, error, accountPool } = data;
+  const t = useTranslations("home");
 
   return (
     <div
@@ -83,11 +86,24 @@ function ProviderNode({ data }: { data: ProviderNodeData }) {
         <ProviderIcon providerId={providerId} size={16} type="color" />
       </div>
 
-      <span
-        className="text-xs font-medium truncate flex-1"
-        style={{ color: active ? color : error ? "#ef4444" : "var(--color-text-main)" }}
-      >
-        {label}
+      <span className="min-w-0 flex-1">
+        <span
+          className="block text-xs font-medium truncate"
+          style={{ color: active ? color : error ? "#ef4444" : "var(--color-text-main)" }}
+        >
+          {label}
+        </span>
+        {accountPool && (
+          <span
+            className="block text-[9px] text-text-muted tabular-nums"
+            aria-label={t("accountPoolSummary")}
+          >
+            {t("accountPoolNodeSummary", {
+              eligible: accountPool.summary.routingEligible,
+              total: accountPool.summary.TOTAL,
+            })}
+          </span>
+        )}
       </span>
 
       {(active || error) && <StatusDot color={color} error={error} />}
@@ -160,7 +176,8 @@ function buildLayout(
   providers: ProviderEntry[],
   activeSet: Set<string>,
   lastSet: Set<string>,
-  errorSet: Set<string>
+  errorSet: Set<string>,
+  accountTelemetry: Record<string, ProviderAccountTelemetry | null>
 ): { nodes: Node[]; edges: Edge[] } {
   const nodeW = 156;
   const nodeH = 28;
@@ -223,6 +240,7 @@ function buildLayout(
           providerId: p.provider,
           active,
           error,
+          accountPool: accountTelemetry[pid] || null,
         } satisfies ProviderNodeData,
         draggable: false,
       });
@@ -247,6 +265,7 @@ type Props = {
   activeRequests?: Array<{ provider?: string; model?: string }>;
   lastProvider?: string;
   errorProvider?: string;
+  accountTelemetry?: Record<string, ProviderAccountTelemetry | null>;
 };
 
 export default function ProviderTopology({
@@ -254,6 +273,7 @@ export default function ProviderTopology({
   activeRequests = [],
   lastProvider = "",
   errorProvider = "",
+  accountTelemetry = {},
 }: Props) {
   const t = useTranslations("common");
   const activeKey = useMemo(
@@ -276,9 +296,9 @@ export default function ProviderTopology({
   const errorSet = useMemo(() => new Set<string>(errorKey ? [errorKey] : []), [errorKey]);
 
   const { nodes, edges } = useMemo(
-    () => buildLayout(providers, activeSet, lastSet, errorSet),
+    () => buildLayout(providers, activeSet, lastSet, errorSet, accountTelemetry),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [providers, activeSet, lastKey, errorKey]
+    [providers, activeSet, lastKey, errorKey, accountTelemetry]
   );
 
   const providersKey = useMemo(
@@ -304,13 +324,134 @@ export default function ProviderTopology({
     );
   }
 
+  const accountPools = Object.values(accountTelemetry).filter(
+    (pool): pool is ProviderAccountTelemetry => Boolean(pool)
+  );
+
   return (
-    <FlowCanvas
-      nodes={nodes}
-      edges={edges}
-      nodeTypes={nodeTypes}
-      fitKey={providersKey}
-      className={containerClass}
-    />
+    <div className="space-y-3">
+      <FlowCanvas
+        nodes={nodes}
+        edges={edges}
+        nodeTypes={nodeTypes}
+        fitKey={providersKey}
+        className={containerClass}
+      />
+      {accountPools.map((pool) => (
+        <AccountPoolSummary key={pool.provider} pool={pool} />
+      ))}
+    </div>
+  );
+}
+
+function AccountPoolSummary({ pool }: { pool: ProviderAccountTelemetry }) {
+  const t = useTranslations("home");
+  const [expanded, setExpanded] = useState(false);
+  const unavailable =
+    pool.summary.WAITING_QUOTA_RESET +
+    pool.summary.DEGRADED +
+    pool.summary.AUTH_ERROR +
+    pool.summary.DISABLED +
+    pool.summary.UNKNOWN;
+
+  return (
+    <section
+      className="rounded-xl border border-border bg-bg-subtle/20 p-3"
+      aria-label={t("accountPoolAria", { provider: pool.provider })}
+    >
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <h3 className="text-sm font-semibold capitalize">
+            {t("accountPoolTitle", { provider: pool.provider })}
+          </h3>
+          <p className="text-[11px] text-text-muted">{t("accountPoolDescription")}</p>
+        </div>
+        <button
+          type="button"
+          onClick={() => setExpanded((value) => !value)}
+          aria-expanded={expanded}
+          className="rounded-md border border-border px-2.5 py-1.5 text-xs hover:bg-bg-subtle focus-visible:outline-2 focus-visible:outline-primary"
+        >
+          {expanded ? t("hideAccounts") : t("accountDetails")}
+        </button>
+      </div>
+      <dl className="mt-3 grid grid-cols-2 gap-2 text-xs sm:grid-cols-4 lg:grid-cols-7">
+        {[
+          [t("accountPoolTotal"), pool.summary.TOTAL],
+          [t("accountPoolReady"), pool.summary.READY],
+          [t("accountPoolActive"), pool.summary.ACTIVE],
+          [t("accountPoolWaitingReset"), pool.summary.WAITING_QUOTA_RESET],
+          [t("accountPoolDegradedError"), unavailable - pool.summary.WAITING_QUOTA_RESET],
+          [t("accountPoolRoutingEligible"), pool.summary.routingEligible],
+          [t("accountPoolStale"), pool.accounts.filter((account) => account.stale).length],
+        ].map(([label, value]) => (
+          <div key={label} className="rounded-lg bg-bg px-2.5 py-2">
+            <dt className="text-[10px] text-text-muted">{label}</dt>
+            <dd className="mt-0.5 font-semibold tabular-nums">{value}</dd>
+          </div>
+        ))}
+      </dl>
+      {expanded && (
+        <div className="mt-3 overflow-x-auto">
+          <table className="w-full min-w-[720px] text-left text-xs">
+            <thead className="text-text-muted">
+              <tr>
+                <th scope="col" className="px-2 py-1.5">
+                  {t("accountPoolAccount")}
+                </th>
+                <th scope="col" className="px-2 py-1.5">
+                  {t("accountPoolState")}
+                </th>
+                <th scope="col" className="px-2 py-1.5">
+                  {t("accountPoolEligible")}
+                </th>
+                <th scope="col" className="px-2 py-1.5">
+                  {t("accountPoolAssignments")}
+                </th>
+                <th scope="col" className="px-2 py-1.5">
+                  {t("accountPoolQuota")}
+                </th>
+                <th scope="col" className="px-2 py-1.5">
+                  {t("accountPoolLastProbe")}
+                </th>
+                <th scope="col" className="px-2 py-1.5">
+                  {t("accountPoolReason")}
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              {pool.accounts.map((account) => (
+                <tr key={account.accountId} className="border-t border-border">
+                  <th scope="row" className="px-2 py-2 font-medium">
+                    {account.displayName}
+                  </th>
+                  <td className="px-2 py-2">
+                    {account.state}
+                    {account.stale ? ` · ${t("accountPoolStale")}` : ""}
+                  </td>
+                  <td className="px-2 py-2">
+                    {account.routingEligible ? t("accountPoolYes") : t("accountPoolNo")}
+                  </td>
+                  <td className="px-2 py-2 tabular-nums">
+                    {account.activeAssignmentCount}
+                    {account.maxConcurrent ? ` / ${account.maxConcurrent}` : ""}
+                  </td>
+                  <td className="px-2 py-2 tabular-nums">
+                    {account.quota.remainingPercent === null
+                      ? t("accountPoolUnknown")
+                      : t("accountPoolRemaining", { percent: account.quota.remainingPercent })}
+                    {account.quota.validationRequired
+                      ? ` · ${t("accountPoolValidationRequired")}`
+                      : ""}
+                  </td>
+                  <td className="px-2 py-2">{account.lastProbeAt || t("accountPoolNever")}</td>
+                  <td className="px-2 py-2">{account.routingIneligibleReason || "—"}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
   );
 }
