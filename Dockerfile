@@ -1,5 +1,8 @@
 # ── Common base with runtime deps ──────────────────────────────────────────
-FROM node:24-trixie-slim AS base
+# Pin the verified Node patch release. The moving node:24-trixie-slim tag moved
+# to 24.19.0 and triggers a better-sqlite3 cleanup-hook assertion in concurrent
+# Next build workers; 24.18.1 is the runtime used by the reconciled build gates.
+FROM node:24.18.1-trixie-slim AS base
 WORKDIR /app
 
 # `apt-get upgrade` pulls the security-patched versions of the Debian (trixie)
