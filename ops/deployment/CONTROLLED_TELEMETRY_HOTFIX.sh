@@ -11,7 +11,6 @@ readonly PUBLIC_JSON="/opt/omniroute/account-ops/public/account-telemetry-codex.
 readonly DATA_DB="/opt/omniroute/data/storage.sqlite"
 readonly BACKUP_ROOT="/opt/omniroute/account-ops/backups"
 readonly RECONCILE_DROPIN="/etc/systemd/system/omniroute-account-reconcile.service.d/50-canonical-account-telemetry.conf"
-readonly ROUTER_POST="/usr/bin/python3 $TARGET_ADAPTER --input $DATA_DB --input-format router-sqlite --output $PUBLIC_JSON && /bin/chmod 0644 $PUBLIC_JSON"
 readonly STAGING_ROOT="/opt/omniroute/account-ops/staging"
 
 if [[ "${1:-}" != "--owner-reviewed-execute" ]]; then
@@ -94,7 +93,9 @@ install -m 0755 "$SOURCE_ADAPTER" "$staged_adapter"
 install -m 0644 "$private_output" "$staged_public"
 {
   printf '%s\n' '[Service]'
-  printf 'ExecStartPost=/bin/sh -c %q\n' "$ROUTER_POST"
+  printf 'ExecStartPost=/usr/bin/python3 %s --input %s --input-format router-sqlite --output %s\n' \
+    "$TARGET_ADAPTER" "$DATA_DB" "$PUBLIC_JSON"
+  printf 'ExecStartPost=/bin/chmod 0644 %s\n' "$PUBLIC_JSON"
 } >"$staged_dropin"
 chmod 0644 "$staged_dropin"
 mv -f "$staged_adapter" "$TARGET_ADAPTER"

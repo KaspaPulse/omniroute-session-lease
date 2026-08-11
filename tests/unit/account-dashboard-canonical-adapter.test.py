@@ -9,6 +9,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = ROOT / "ops/account-dashboard/canonical_contract_adapter.py"
+HOTFIX = ROOT / "ops/deployment/CONTROLLED_TELEMETRY_HOTFIX.sh"
 SPEC = importlib.util.spec_from_file_location("canonical_contract_adapter", SOURCE)
 assert SPEC and SPEC.loader
 adapter = importlib.util.module_from_spec(SPEC)
@@ -201,6 +202,15 @@ class CanonicalDashboardAdapterTests(unittest.TestCase):
             self.assertEqual(result["summary"]["routingEligible"], 9)
             self.assertNotIn("private-connection", serialized)
             self.assertNotIn("must-not-serialize", serialized)
+
+    def test_hotfix_generates_direct_systemd_post_steps(self):
+        source = HOTFIX.read_text(encoding="utf-8")
+        self.assertIn(
+            "ExecStartPost=/usr/bin/python3 %s --input %s --input-format router-sqlite --output %s",
+            source,
+        )
+        self.assertIn("ExecStartPost=/bin/chmod 0644 %s", source)
+        self.assertNotIn("ExecStartPost=/bin/sh -c", source)
 
 
 if __name__ == "__main__":
