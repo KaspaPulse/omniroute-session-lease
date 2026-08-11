@@ -9,7 +9,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { CodexExecutor, __setCodexWebSocketTransportForTesting } from "../../open-sse/executors/codex.ts";
+import {
+  CodexExecutor,
+  __setCodexWebSocketTransportForTesting,
+  parseCodexTerminal429SseBlock,
+} from "../../open-sse/executors/codex.ts";
 
 test.afterEach(() => {
   __setCodexWebSocketTransportForTesting(undefined);
@@ -91,6 +95,63 @@ test("CodexExecutor.execute converts server_is_overloaded / service_unavailable_
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test("CodexExecutor.execute converts a structured response.failed 429 inside HTTP 200 SSE", async () => {
+  const executor = new CodexExecutor();
+  const originalFetch = globalThis.fetch;
+  const terminal429 = {
+    type: "response.failed",
+    response: {
+      status: "failed",
+      error: {
+        status_code: 429,
+        code: "rate_limit_exceeded",
+        message: "Too Many Requests",
+        retry_after_seconds: 17,
+        correlation_id: "synthetic-correlation",
+      },
+    },
+  };
+
+  globalThis.fetch = async () =>
+    new Response(
+      sseStreamFromChunks([`event: response.failed\ndata: ${JSON.stringify(terminal429)}\n\n`]),
+      { status: 200, headers: { "Content-Type": "text/event-stream" } }
+    );
+
+  try {
+    const result = await executor.execute({
+      model: "gpt-5.5",
+      body: { model: "gpt-5.5", input: [{ role: "user", content: "hello" }] },
+      stream: true,
+      credentials: { accessToken: "codex-token" },
+    });
+
+    assert.equal(result.response.status, 429);
+    assert.equal(result.response.headers.get("retry-after"), "17");
+    assert.equal(
+      result.response.headers.get("x-omniroute-upstream-correlation-id"),
+      "synthetic-correlation"
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("terminal 429 parser ignores ordinary text and structured non-429 failures", () => {
+  assert.equal(
+    parseCodexTerminal429SseBlock(
+      'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"429 is a number"}\n\n'
+    ),
+    null
+  );
+  assert.equal(
+    parseCodexTerminal429SseBlock(
+      'event: response.failed\ndata: {"type":"response.failed","response":{"status":"failed","error":{"status_code":500,"message":"429 in text"}}}\n\n'
+    ),
+    null
+  );
 });
 
 test("CodexExecutor.execute reassembles a normal 200-OK SSE stream byte-intact after peeking for transient errors", async () => {

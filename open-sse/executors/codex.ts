@@ -587,6 +587,106 @@ const CODEX_SSE_TRANSIENT_ERROR_PATTERNS = [
 // buffer before giving up and passing the stream through unchanged.
 const CODEX_SSE_PEEK_MAX_BYTES = 8192;
 
+type CodexSseTerminal429 = {
+  message: string;
+  code: string | null;
+  correlationId: string | null;
+  retryAfterSeconds: number | null;
+};
+
+function firstString(...values: unknown[]): string | null {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return null;
+}
+
+function firstFiniteNumber(...values: unknown[]): number | null {
+  for (const value of values) {
+    const parsed = typeof value === "number" ? value : Number.parseFloat(String(value ?? ""));
+    if (Number.isFinite(parsed) && parsed >= 0) return parsed;
+  }
+  return null;
+}
+
+/**
+ * Recognize only a structured terminal Responses API failure whose status is
+ * explicitly 429. Free-form model/user text containing the digits "429" is
+ * intentionally ignored. This closes the live-TUI gap where ChatGPT answers
+ * HTTP 200 and embeds the terminal rate-limit in `response.failed`.
+ */
+export function parseCodexTerminal429SseBlock(block: string): CodexSseTerminal429 | null {
+  let eventType = "";
+  const dataLines: string[] = [];
+  for (const rawLine of block.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (line.startsWith("event:")) eventType = line.slice(6).trim();
+    if (line.startsWith("data:")) dataLines.push(line.slice(5).trimStart());
+  }
+  const data = dataLines.join("\n").trim();
+  if (!data || data === "[DONE]") return null;
+
+  try {
+    const parsed = JSON.parse(data) as Record<string, unknown>;
+    const response =
+      parsed.response && typeof parsed.response === "object"
+        ? (parsed.response as Record<string, unknown>)
+        : {};
+    const error =
+      response.error && typeof response.error === "object"
+        ? (response.error as Record<string, unknown>)
+        : parsed.error && typeof parsed.error === "object"
+          ? (parsed.error as Record<string, unknown>)
+          : {};
+    const terminalType = firstString(parsed.type, eventType);
+    if (terminalType !== "response.failed") return null;
+
+    const explicitStatus = firstFiniteNumber(
+      error.status,
+      error.status_code,
+      error.http_status,
+      response.status_code,
+      response.http_status,
+      parsed.status_code,
+      parsed.http_status
+    );
+    const code = firstString(error.code, error.type);
+    const normalizedCode = code?.toLowerCase().replace(/[- ]/g, "_") ?? "";
+    const structuredRateLimitCode = new Set([
+      "429",
+      "rate_limit_exceeded",
+      "rate_limit_error",
+      "too_many_requests",
+    ]).has(normalizedCode);
+    if (explicitStatus !== 429 && !structuredRateLimitCode) return null;
+
+    const correlationId = firstString(
+      error.request_id,
+      error.correlation_id,
+      response.request_id,
+      response.correlation_id,
+      parsed.request_id,
+      parsed.correlation_id
+    );
+    const retryAfterSeconds = firstFiniteNumber(
+      error.retry_after,
+      error.retry_after_seconds,
+      response.retry_after,
+      response.retry_after_seconds,
+      parsed.retry_after,
+      parsed.retry_after_seconds
+    );
+    return {
+      message: firstString(error.message, response.message, parsed.message) ?? "Codex rate limited",
+      code,
+      correlationId,
+      retryAfterSeconds,
+    };
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Best-effort extraction of the human-readable error message from a peeked SSE
  * chunk, so the resulting 503 body carries something more useful than the raw
@@ -616,7 +716,14 @@ function extractCodexSseErrorMessage(text: string, fallback: string): string {
 }
 
 type CodexSseTransientErrorPeek =
-  | { matched: string; message: string; replacementBody: null }
+  | {
+      matched: string;
+      message: string;
+      replacementBody: null;
+      status: 429 | 503;
+      retryAfterSeconds: number | null;
+      correlationId: string | null;
+    }
   | { matched: null; message: null; replacementBody: ReadableStream<Uint8Array> | null };
 
 /**
@@ -636,6 +743,7 @@ export async function peekCodexSseTransientError(
   const chunks: Uint8Array[] = [];
   let text = "";
   let matched: string | null = null;
+  let terminal429: CodexSseTerminal429 | null = null;
 
   try {
     while (text.length < CODEX_SSE_PEEK_MAX_BYTES) {
@@ -643,6 +751,15 @@ export async function peekCodexSseTransientError(
       if (done) break;
       chunks.push(value);
       text += decoder.decode(value, { stream: true });
+      const blocks = text.split(/\r?\n\r?\n/);
+      for (const block of blocks.slice(0, -1)) {
+        terminal429 = parseCodexTerminal429SseBlock(block);
+        if (terminal429) break;
+      }
+      if (terminal429) {
+        matched = "response.failed:429";
+        break;
+      }
       const lower = text.toLowerCase();
       const hit = CODEX_SSE_TRANSIENT_ERROR_PATTERNS.find((pattern) => lower.includes(pattern));
       if (hit) {
@@ -672,7 +789,14 @@ export async function peekCodexSseTransientError(
     } catch {
       // Upstream socket may already be closing; nothing to clean up.
     }
-    return { matched, message: extractCodexSseErrorMessage(text, matched), replacementBody: null };
+    return {
+      matched,
+      message: terminal429?.message ?? extractCodexSseErrorMessage(text, matched),
+      replacementBody: null,
+      status: terminal429 ? 429 : 503,
+      retryAfterSeconds: terminal429?.retryAfterSeconds ?? null,
+      correlationId: terminal429?.correlationId ?? null,
+    };
   }
 
   reader.releaseLock();
@@ -824,12 +948,22 @@ export class CodexExecutor extends BaseExecutor {
         if (peek.matched) {
           input.log?.warn?.(
             "RETRY",
-            `CODEX | 200-OK SSE carried transient error "${peek.matched}" — converting to 503 for account fallback`
+            `CODEX | 200-OK SSE carried ${peek.status} terminal error "${peek.matched}"${peek.correlationId ? ` correlation=${peek.correlationId.slice(0, 64)}` : ""} — converting for account fallback`
           );
-          (httpResult as { response: Response }).response = errorResponse(
-            HTTP_STATUS.SERVICE_UNAVAILABLE,
+          const converted = errorResponse(
+            peek.status === 429 ? HTTP_STATUS.RATE_LIMITED : HTTP_STATUS.SERVICE_UNAVAILABLE,
             peek.message
           );
+          if (peek.retryAfterSeconds != null) {
+            converted.headers.set("retry-after", String(peek.retryAfterSeconds));
+          }
+          if (peek.correlationId) {
+            converted.headers.set(
+              "x-omniroute-upstream-correlation-id",
+              peek.correlationId.slice(0, 128)
+            );
+          }
+          (httpResult as { response: Response }).response = converted;
         } else if (peek.replacementBody) {
           (httpResult as { response: Response }).response = new Response(peek.replacementBody, {
             status: resp.status,

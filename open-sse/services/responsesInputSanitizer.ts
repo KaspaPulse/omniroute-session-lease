@@ -95,12 +95,22 @@ function sanitizeMessageContent(record: JsonRecord): JsonRecord {
 function sanitizeOutputContent(record: JsonRecord): JsonRecord {
   if (!Array.isArray(record.output)) return record;
 
-  // Some clients replay previous Responses output items inside the next
-  // Responses input. In that shape OpenAI validates `input[n].output[m].type`
-  // against output content part types, so legacy Chat-style `image_url` parts
-  // must be normalized here too, not only in message.content.
+  // Replayed item.output arrays are nested inside request input. The upstream
+  // schema validates function output as input-side parts, so response-only
+  // output_text must be normalized to input_text there. Assistant message
+  // output remains response-side content and keeps output_text semantics.
   const role = record.type === "function_call_output" ? "user" : "assistant";
-  const output = record.output.map((part) => sanitizeContentPart(part, role));
+  const output = record.output.map((part) => {
+    const sanitized = sanitizeContentPart(part, role);
+    const content = toRecord(sanitized);
+    if (role !== "user" || !content || content.type !== "output_text") return sanitized;
+
+    const next: JsonRecord = { ...content, type: "input_text" };
+    delete next.annotations;
+    delete next.logprobs;
+    delete next.obfuscation;
+    return next;
+  });
   return { ...record, output };
 }
 

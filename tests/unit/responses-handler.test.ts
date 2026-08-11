@@ -242,6 +242,31 @@ test("handleResponsesCore preserves store for Codex responses when connection op
   assert.equal(call.body.stream, true);
 });
 
+test("handleResponsesCore forwards canonical Codex quota headers to Responses clients", async () => {
+  const { result } = await invokeResponsesCore({
+    provider: "codex",
+    model: "gpt-5.3-codex",
+    body: {
+      model: "gpt-5.3-codex",
+      input: [{ type: "message", role: "user", content: "hello" }],
+    },
+    responseFactory: () => {
+      const response = buildOpenAISseResponse();
+      response.headers.set("x-codex-primary-used-percent", "42");
+      response.headers.set("x-codex-primary-window-minutes", "300");
+      response.headers.set("x-codex-primary-reset-at", "1924992000");
+      response.headers.set("x-codex-promo-message", "synthetic promo");
+      return response;
+    },
+  });
+
+  assert.equal(result.success, true);
+  assert.equal(result.response.headers.get("x-codex-primary-used-percent"), "42");
+  assert.equal(result.response.headers.get("x-codex-primary-window-minutes"), "300");
+  assert.equal(result.response.headers.get("x-codex-primary-reset-at"), "1924992000");
+  assert.equal(result.response.headers.get("x-codex-promo-message"), "synthetic promo");
+});
+
 test("handleResponsesCore transforms upstream OpenAI SSE into Responses API SSE", async () => {
   const { result } = await invokeResponsesCore({
     body: {

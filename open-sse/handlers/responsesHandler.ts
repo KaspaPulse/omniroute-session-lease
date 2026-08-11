@@ -10,6 +10,71 @@ import { createResponsesApiTransformStream } from "../transformer/responsesTrans
 import { createSseHeartbeatTransform, HEARTBEAT_SHAPES } from "../utils/sseHeartbeat.ts";
 import { SSE_HEARTBEAT_INTERVAL_MS } from "../config/constants.ts";
 
+// OMNIROUTE_CODEX_STATUSLINE_RATE_LIMIT_FORWARDING
+function buildCodexClientResponseHeaders(upstreamHeaders) {
+  const headers = new Headers({
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive",
+  });
+
+  for (const name of [
+    "x-codex-primary-used-percent",
+    "x-codex-primary-window-minutes",
+    "x-codex-primary-reset-at",
+    "x-codex-secondary-used-percent",
+    "x-codex-secondary-window-minutes",
+    "x-codex-secondary-reset-at",
+    "x-codex-credits-has-credits",
+    "x-codex-credits-unlimited",
+    "x-codex-credits-balance",
+    "x-codex-limit-name",
+    "x-codex-promo-message",
+    "x-codex-rate-limit-reached-type",
+  ]) {
+    const value = upstreamHeaders.get(name);
+    if (value != null && value !== "") headers.set(name, value);
+  }
+
+  const setLegacyWindow = (modernPrefix, usageName, limitName, resetName, windowMinutes) => {
+    const usedHeader = `${modernPrefix}-used-percent`;
+    const windowHeader = `${modernPrefix}-window-minutes`;
+    const resetHeader = `${modernPrefix}-reset-at`;
+
+    if (!headers.has(usedHeader)) {
+      const usage = Number(upstreamHeaders.get(usageName));
+      const limit = Number(upstreamHeaders.get(limitName));
+      if (Number.isFinite(usage) && Number.isFinite(limit) && limit > 0) {
+        headers.set(usedHeader, String(Math.max(0, Math.min(100, (usage / limit) * 100))));
+      }
+    }
+    if (!headers.has(windowHeader)) headers.set(windowHeader, String(windowMinutes));
+    if (!headers.has(resetHeader)) {
+      const reset = upstreamHeaders.get(resetName);
+      if (reset) {
+        const ms = Date.parse(reset);
+        if (Number.isFinite(ms)) headers.set(resetHeader, String(Math.floor(ms / 1000)));
+      }
+    }
+  };
+
+  setLegacyWindow(
+    "x-codex-primary",
+    "x-codex-5h-usage",
+    "x-codex-5h-limit",
+    "x-codex-5h-reset-at",
+    300
+  );
+  setLegacyWindow(
+    "x-codex-secondary",
+    "x-codex-7d-usage",
+    "x-codex-7d-limit",
+    "x-codex-7d-reset-at",
+    10080
+  );
+  return headers;
+}
+
 /**
  * Handle /v1/responses request
  * @param {object} options
@@ -82,11 +147,7 @@ export async function handleResponsesCore({
     success: true,
     response: new Response(transformedBody, {
       status: 200,
-      headers: {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        Connection: "keep-alive",
-      },
+      headers: buildCodexClientResponseHeaders(response.headers),
     }),
   };
 }
