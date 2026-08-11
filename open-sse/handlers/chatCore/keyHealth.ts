@@ -28,10 +28,16 @@ type KeyHealthLog = {
   error?: (tag: string, message: string) => void;
 } | null;
 
+type PersistProviderConnection = (
+  connectionId: string,
+  data: Record<string, unknown>
+) => Promise<unknown>;
+
 export function recordKeyHealthStatus(
   status: number,
   creds: Record<string, unknown> | null | undefined,
-  log?: KeyHealthLog
+  log?: KeyHealthLog,
+  persistProviderConnection: PersistProviderConnection = updateProviderConnection
 ): void {
   const connId = creds?.connectionId as string | undefined;
   if (!connId) return;
@@ -40,6 +46,10 @@ export function recordKeyHealthStatus(
   const extraKeys = (psd?.extraApiKeys as string[] | undefined) ?? [];
   const health = psd?.apiKeyHealth as Record<string, KeyHealth> | undefined;
   const currentKeyId = (psd?.selectedKeyId as string | undefined) ?? "primary";
+  // Credentials can originate from the same DB object used to hydrate mutable runtime
+  // health. Snapshot the selected record before any accounting call so persistence
+  // decisions never depend on reference identity or a post-mutation value.
+  const priorHealth = health?.[currentKeyId] ? { ...health[currentKeyId] } : undefined;
 
   trackConnectionExtraKeys(connId, extraKeys);
 
@@ -52,10 +62,10 @@ export function recordKeyHealthStatus(
 
     // Persist health status to DB on every failure (not just invalid transitions)
     // This ensures in-memory state survives process restarts
-    const prevStatus = health?.[currentKeyId]?.status;
-    const prevFailures = health?.[currentKeyId]?.failures ?? 0;
+    const prevStatus = priorHealth?.status;
+    const prevFailures = priorHealth?.failures ?? 0;
     if (updatedHealth.status !== prevStatus || updatedHealth.failures !== prevFailures) {
-      updateProviderConnection(connId, {
+      persistProviderConnection(connId, {
         providerSpecificData: {
           ...psd,
           apiKeyHealth: { ...health, [currentKeyId]: updatedHealth },
@@ -79,9 +89,9 @@ export function recordKeyHealthStatus(
       `402 on connection ${connId.slice(0, 8)} - key ${currentKeyId} marked invalid (insufficient balance)`
     );
 
-    const prevStatus = health?.[currentKeyId]?.status;
+    const prevStatus = priorHealth?.status;
     if (updatedHealth.status !== prevStatus) {
-      updateProviderConnection(connId, {
+      persistProviderConnection(connId, {
         providerSpecificData: {
           ...psd,
           apiKeyHealth: { ...health, [currentKeyId]: updatedHealth },
@@ -95,9 +105,9 @@ export function recordKeyHealthStatus(
     }
   } else if (status >= 200 && status < 300) {
     const updatedHealth = recordKeySuccess(connId, currentKeyId);
-    const prevStatus = health?.[currentKeyId]?.status;
+    const prevStatus = priorHealth?.status;
     if (prevStatus === "warning" || prevStatus === "invalid") {
-      updateProviderConnection(connId, {
+      persistProviderConnection(connId, {
         providerSpecificData: {
           ...psd,
           apiKeyHealth: { ...health, [currentKeyId]: updatedHealth },

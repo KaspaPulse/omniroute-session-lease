@@ -15,6 +15,12 @@ import { getAllKeyHealth, removeConnectionHealth } from "../../open-sse/services
 
 const noopLog = { warn: () => {}, error: () => {} };
 const touched: string[] = [];
+const here = path.dirname(fileURLToPath(import.meta.url));
+const chatCoreSource = fs.readFileSync(
+  path.resolve(here, "../../open-sse/handlers/chatCore.ts"),
+  "utf8"
+);
+const sharedAccountingCall = "recordKeyHealthStatus(res.response.status, execCreds);";
 
 function creds(connectionId: string, psd: Record<string, unknown> = {}) {
   touched.push(connectionId);
@@ -80,14 +86,15 @@ test("non-401 / non-2xx status does not touch key health", () => {
   assert.equal(getAllKeyHealth()[`${conn}:primary`], undefined);
 });
 
-test("chatCore records key health once at the shared upstream-response boundary", () => {
-  const here = path.dirname(fileURLToPath(import.meta.url));
-  const source = fs.readFileSync(path.resolve(here, "../../open-sse/handlers/chatCore.ts"), "utf8");
-  const call = "recordKeyHealthStatus(res.response.status, execCreds);";
-  assert.equal(source.split(call).length - 1, 1);
-  assert.ok(source.indexOf(call) < source.indexOf("if (stream) {"));
+test("STREAMING_200_SINGLE_ACCOUNTING", () => {
+  assert.equal(chatCoreSource.split(sharedAccountingCall).length - 1, 1);
+  assert.ok(chatCoreSource.indexOf(sharedAccountingCall) < chatCoreSource.indexOf("if (stream) {"));
+});
+
+test("NON_STREAM_200_SINGLE_ACCOUNTING", () => {
+  assert.equal(chatCoreSource.split(sharedAccountingCall).length - 1, 1);
   assert.doesNotMatch(
-    source,
+    chatCoreSource,
     /recordKeyHealthStatus\(status,\s*rawResult\._executionCredentials\)/
   );
 });

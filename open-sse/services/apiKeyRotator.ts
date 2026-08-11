@@ -304,7 +304,10 @@ export function syncHealthFromDB(connectionId: string, health?: Record<string, K
       const oldest = _keyHealth.keys().next().value;
       if (oldest !== undefined) _keyHealth.delete(oldest);
     }
-    _keyHealth.set(scopedKey, keyHealth);
+    // DB-loaded provider-specific data belongs to the credential snapshot. Runtime
+    // accounting mutates health in place, so retain an independently-owned bounded
+    // health record rather than aliasing the credential object used for persistence.
+    _keyHealth.set(scopedKey, { ...keyHealth });
   }
 }
 
