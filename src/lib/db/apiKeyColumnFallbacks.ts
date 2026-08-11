@@ -11,6 +11,10 @@ export const API_KEY_COLUMN_FALLBACKS = [
   { name: "max_requests_per_minute", definition: "max_requests_per_minute INTEGER" },
   { name: "throttle_delay_ms", definition: "throttle_delay_ms INTEGER" },
   { name: "max_sessions", definition: "max_sessions INTEGER NOT NULL DEFAULT 0" },
+  {
+    name: "exclusive_session_connections",
+    definition: "exclusive_session_connections INTEGER NOT NULL DEFAULT 0",
+  },
   { name: "revoked_at", definition: "revoked_at TEXT" },
   { name: "expires_at", definition: "expires_at TEXT" },
   { name: "last_used_at", definition: "last_used_at TEXT" },

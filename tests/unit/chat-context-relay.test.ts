@@ -8,6 +8,7 @@ const { BaseExecutor, buildRequest, combosDb, handleChat, resetStorage, waitFor,
   harness as any;
 const providersDb = await import("../../src/lib/db/providers.ts");
 const handoffDb = await import("../../src/lib/db/contextHandoffs.ts");
+const leaseDb = await import("../../src/lib/db/exclusiveConnectionLeases.ts");
 
 function buildResponsesResponse(text = "ok", model = "gpt-5.6-sol") {
   return new Response(
@@ -195,6 +196,54 @@ test("handleChat generates and injects context-relay handoffs across Codex accou
   assert.match(upstreamBodies[1].serializedBody, /Carry over the router implementation state/);
   assert.equal(handoffDb.getHandoff(sessionId, "relay-combo"), null);
   await new Promise((resolve) => setTimeout(resolve, 50));
+});
+
+test("exclusive lease failover keeps Context Relay continuity on the free sibling", async () => {
+  const owner = "header:exclusive-relay-session";
+  const first = leaseDb.acquireExclusiveConnectionLease({
+    apiKeyId: "exclusive-relay-key",
+    provider: "codex",
+    ownerKey: owner,
+    candidateConnectionIds: ["relay-connection-a", "relay-connection-b"],
+  });
+  assert.equal(first.kind, "acquired");
+  if (first.kind !== "acquired") return;
+  handoffDb.upsertHandoff({
+    sessionId: "ext:exclusive-relay-session",
+    comboName: "exclusive-relay-combo",
+    fromAccount: first.lease.connectionId,
+    summary: "Continue the same durable task after account rotation",
+    keyDecisions: ["Never steal another active lease"],
+    taskProgress: "Reacquire a free sibling and inject this handoff",
+    activeEntities: ["exclusive_connection_leases"],
+    messageCount: 3,
+    model: "codex/gpt-5.6-sol",
+    warningThresholdPct: 0.85,
+    generatedAt: new Date().toISOString(),
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+  });
+  leaseDb.releaseExclusiveConnectionLease({
+    apiKeyId: "exclusive-relay-key",
+    provider: "codex",
+    ownerKey: owner,
+    generation: first.lease.generation,
+    reason: "UPSTREAM_429",
+  });
+  const replacement = leaseDb.acquireExclusiveConnectionLease({
+    apiKeyId: "exclusive-relay-key",
+    provider: "codex",
+    ownerKey: owner,
+    candidateConnectionIds: ["relay-connection-b"],
+  });
+  assert.equal(replacement.kind, "acquired");
+  assert.notEqual(
+    replacement.kind === "acquired" ? replacement.lease.connectionId : null,
+    first.lease.connectionId
+  );
+  assert.match(
+    handoffDb.getHandoff("ext:exclusive-relay-session", "exclusive-relay-combo")!.summary,
+    /same durable task/
+  );
 });
 
 test("handleChat injects context-relay handoffs during live failover for Responses-native Codex requests", async () => {

@@ -89,6 +89,7 @@ export interface ApiKeyMetadata {
   maxRequestsPerMinute?: number | null;
   throttleDelayMs?: number | null;
   maxSessions?: number | null;
+  exclusiveSessionConnections?: boolean;
   rateLimits?: RateLimitRule[] | null;
   scopes?: string[];
   allowedEndpoints?: string[];

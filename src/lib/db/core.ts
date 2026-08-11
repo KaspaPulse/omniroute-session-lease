@@ -120,6 +120,7 @@ const CRITICAL_DB_TABLES: CriticalTableSpec[] = [
   { table: "account_key_limits", maxRows: 10_000 },
   { table: "upstream_proxy_config", maxRows: 5_000 },
   { table: "webhooks", maxRows: 5_000 },
+  { table: "exclusive_connection_leases", maxRows: 10_000 },
 ];
 
 export function isNativeSqliteLoadError(error: unknown): boolean {
@@ -1020,8 +1021,7 @@ export function getDbInstance(): SqliteDatabase {
         let hasData = false;
         try {
           const count = probe.prepare("SELECT COUNT(*) as c FROM provider_connections").get() as
-            | { c: number }
-            | undefined;
+            { c: number } | undefined;
           hasData = Boolean(count && count.c > 0);
         } catch {
           // Table might not exist at all — truly incompatible
@@ -1075,7 +1075,11 @@ export function getDbInstance(): SqliteDatabase {
       // V8 heap (sql.js loads the whole file into WASM memory). Throwing
       // immediately gives the user a clear "increase --max-old-space-size"
       // signal instead of silently renaming a perfectly good DB.
-      if (/out of memory|allocation failure|Array buffer allocation failed|allocation failed/i.test(message)) {
+      if (
+        /out of memory|allocation failure|Array buffer allocation failed|allocation failed/i.test(
+          message
+        )
+      ) {
         throw new Error(
           `[DB] Out of memory while probing ${sqliteFile}. ` +
             `The bundled sql.js driver loads the entire file into WASM memory; ` +

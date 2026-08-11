@@ -112,6 +112,11 @@ export const PHYSICAL_SCHEMA_SENTINELS = [
   { version: "006", tableName: "request_detail_logs", description: "request_detail_logs table" },
   { version: "004", tableName: "proxy_registry", description: "proxy_registry table" },
   { version: "002", tableName: "mcp_tool_audit", description: "mcp_tool_audit table" },
+  {
+    version: "151",
+    tableName: "exclusive_connection_leases",
+    description: "exclusive connection leases table",
+  },
 ] as const;
 
 export const INITIAL_SCHEMA_SENTINELS = ["provider_connections", "combos", "call_logs"] as const;

@@ -445,10 +445,17 @@ function copyStaticAndPublic({ distDir, relDistDir, projectRoot, resolvedOutDir 
  * @param {string} resolvedOutDir
  */
 function copyNativeAssetsAndExtraModules(projectRoot, resolvedOutDir) {
+  const isSameResolvedPath = (src, dest) =>
+    fsSync.existsSync(dest) && fsSync.realpathSync(src) === fsSync.realpathSync(dest);
+
   for (const asset of NATIVE_ASSET_ENTRIES) {
     const src = path.join(projectRoot, ...asset.src);
     if (!fsSync.existsSync(src)) continue;
     const dest = path.join(resolvedOutDir, ...asset.dest);
+    if (isSameResolvedPath(src, dest)) {
+      console.log(`[assembleStandalone] Native asset already present: ${asset.label}`);
+      continue;
+    }
     fsSync.mkdirSync(path.dirname(dest), { recursive: true });
     fsSync.cpSync(src, dest, { recursive: true, force: true });
     console.log(`[assembleStandalone] Copied native asset: ${asset.label}`);
@@ -458,6 +465,10 @@ function copyNativeAssetsAndExtraModules(projectRoot, resolvedOutDir) {
     const src = path.join(projectRoot, ...mod.src);
     if (!fsSync.existsSync(src)) continue;
     const dest = path.join(resolvedOutDir, ...mod.dest);
+    if (isSameResolvedPath(src, dest)) {
+      console.log(`[assembleStandalone] Module already present: ${mod.label}`);
+      continue;
+    }
     fsSync.mkdirSync(path.dirname(dest), { recursive: true });
     fsSync.cpSync(src, dest, { recursive: true, force: true });
     console.log(`[assembleStandalone] Synced module: ${mod.label}`);

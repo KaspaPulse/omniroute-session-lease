@@ -1,0 +1,1 @@
+- **feat(routing):** add opt-in, durable, fenced exclusive session-to-connection leases that reuse existing health, quota, affinity, strategy, and Context Relay behavior, with stateless capacity backpressure and zero-model lifecycle heartbeats

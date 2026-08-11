@@ -76,7 +76,11 @@ test.after(async () => {
 });
 
 /** Builds a bridge POST request for the internal codex-responses-ws route's "prepare" action. */
-function buildPrepareRequest(apiKey: string, model: string): Request {
+function buildPrepareRequest(
+  apiKey: string,
+  model: string,
+  clientHeaders: Record<string, string> = {}
+): Request {
   return new Request("http://localhost/api/internal/codex-responses-ws", {
     method: "POST",
     headers: {
@@ -88,6 +92,7 @@ function buildPrepareRequest(apiKey: string, model: string): Request {
       // The bridge's real client sends the WS auth token via a query param on
       // requestUrl (api_key/token/access_token) — never a header.
       requestUrl: `/api/v1/responses?api_key=${encodeURIComponent(apiKey)}`,
+      headers: clientHeaders,
       response: { model },
     }),
   });
@@ -113,6 +118,24 @@ test("WS prepare() rejects a DIRECT model not in the key's allowedModels policy 
     "must be rejected by API-key policy, not by (unrelated) missing Codex credentials"
   );
   assert.match(body.error?.message ?? "", /not allowed|not enabled/i);
+});
+
+test("WS prepare() parks an exclusive key that omits its explicit session owner", async () => {
+  const exclusiveKey = await apiKeysDb.createApiKey("Exclusive WS Key", "machine-exclusive-ws");
+  await apiKeysDb.updateApiKeyPermissions(exclusiveKey.id, {
+    allowedModels: ["gpt-5.5"],
+    exclusiveSessionConnections: true,
+  });
+
+  const response = await route.POST(buildPrepareRequest(exclusiveKey.key, "gpt-5.5"));
+  const body = (await response.json()) as {
+    capacity?: { state?: string; reason?: string };
+  };
+
+  assert.equal(response.status, 503);
+  assert.equal(response.headers.get("X-OmniRoute-Capacity-State"), "WAITING_FOR_CAPACITY");
+  assert.equal(body.capacity?.state, "WAITING_FOR_CAPACITY");
+  assert.equal(body.capacity?.reason, "ROUTE_CONFIG_UNCERTAINTY");
 });
 
 test("WS prepare() allows the requested model when the key's policy permits it (proceeds past policy)", async () => {

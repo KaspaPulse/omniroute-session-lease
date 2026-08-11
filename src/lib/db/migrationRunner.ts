@@ -455,6 +455,11 @@ function isSchemaAlreadyApplied(
       // exists the rebuild ran — skip re-executing the rename/copy/drop, which
       // would fail on the missing proxy_assignments_pre117 table.
       return hasColumn(db, "proxy_assignments", "position");
+    case "151":
+      return (
+        hasTable(db, "exclusive_connection_leases") &&
+        hasColumn(db, "api_keys", "exclusive_session_connections")
+      );
     default:
       return false;
   }
@@ -472,6 +477,20 @@ function applyApiKeyLifecycleMigration(db: SqliteAdapter): void {
     CREATE INDEX IF NOT EXISTS idx_api_keys_revoked_at ON api_keys(revoked_at);
     CREATE INDEX IF NOT EXISTS idx_api_keys_expires_at ON api_keys(expires_at);
   `);
+}
+
+function applyExclusiveSessionConnectionLeaseMigration(
+  db: SqliteAdapter,
+  migrationPath: string
+): void {
+  const sql = fs.readFileSync(migrationPath, "utf-8");
+  db.exec(sql);
+  ensureColumn(
+    db,
+    "api_keys",
+    "exclusive_session_connections",
+    "ALTER TABLE api_keys ADD COLUMN exclusive_session_connections INTEGER NOT NULL DEFAULT 0"
+  );
 }
 
 function isSearchRequestTypeMigration(migration: { version: string; name: string }): boolean {
@@ -972,6 +991,11 @@ export function runMigrations(db: SqliteAdapter, options?: { isNewDb?: boolean }
         applyCompressionReceiptsMigration(db);
       } else if (migration.version === "042") {
         applyCompressionCombosMigration(db, migration.path);
+      } else if (
+        migration.version === "151" &&
+        migration.name === "exclusive_session_connection_leases"
+      ) {
+        applyExclusiveSessionConnectionLeaseMigration(db, migration.path);
       } else {
         const sql = fs.readFileSync(migration.path, "utf-8");
         db.exec(sql);

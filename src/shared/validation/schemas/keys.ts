@@ -92,6 +92,7 @@ export const updateKeyPermissionsSchema = z
     isBanned: z.boolean().optional(),
     expiresAt: z.string().datetime().nullable().optional(),
     maxSessions: z.number().int().min(0).max(10000).optional(),
+    exclusiveSessionConnections: z.boolean().optional(),
     accessSchedule: z.union([accessScheduleSchema, z.null()]).optional(),
     rateLimits: z
       .union([
@@ -126,6 +127,7 @@ export const updateKeyPermissionsSchema = z
       value.isBanned === undefined &&
       value.expiresAt === undefined &&
       value.maxSessions === undefined &&
+      value.exclusiveSessionConnections === undefined &&
       value.accessSchedule === undefined &&
       value.rateLimits === undefined &&
       value.scopes === undefined &&

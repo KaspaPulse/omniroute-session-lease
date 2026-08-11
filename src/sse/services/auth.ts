@@ -67,6 +67,16 @@ import { isNoAuthProviderBlockedBySettings } from "./noAuthProviderSettings";
 import { resolveAccountProxiesFromRegistry } from "./noAuthProxyResolution";
 import * as log from "../utils/logger";
 import { fisherYatesShuffle, getNextFromDeckSync } from "@/shared/utils/shuffleDeck";
+import {
+  acquireSelectedExclusiveCredential,
+  classifyExclusiveCredentialFailure,
+  exclusiveCapacityError,
+  filterExclusiveCredentialCandidates,
+  getExclusiveLeaseGeneration,
+  isExclusiveCapacityError,
+  releaseSelectedExclusiveCredential,
+  type ExclusiveCredentialSelectionOptions,
+} from "./exclusiveCredentialSelection";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -110,7 +120,7 @@ interface RecoverableConnectionState {
   lastErrorSource?: string | null;
 }
 
-interface CredentialSelectionOptions {
+interface CredentialSelectionOptions extends ExclusiveCredentialSelectionOptions {
   allowSuppressedConnections?: boolean;
   allowRateLimitedConnections?: boolean;
   bypassQuotaPolicy?: boolean;
@@ -913,7 +923,6 @@ async function markQuotaPreflightAccountUnavailable(
     errorCode: 429,
     lastErrorAt: new Date().toISOString(),
   });
-
   return unavailableUntil;
 }
 
@@ -1186,6 +1195,9 @@ export async function getProviderCredentials(
             expiredStatus: dominantStatus,
           };
         }
+        if (options.exclusiveSessionConnections) {
+          return exclusiveCapacityError("NO_ELIGIBLE_CONNECTIONS_HEALTH_OR_QUOTA");
+        }
       }
       const syntheticFallback = await maybeSyntheticNoAuthFallback(
         resolvedId,
@@ -1386,6 +1398,11 @@ export async function getProviderCredentials(
       );
       if (syntheticFallback) return syntheticFallback;
       log.warn("AUTH", `${provider} | all ${connections.length} accounts unavailable`);
+      if (options.exclusiveSessionConnections) {
+        return connections.every(isTerminalConnectionStatus)
+          ? exclusiveCapacityError("AUTHENTICATION_FAILURE")
+          : exclusiveCapacityError("NO_ELIGIBLE_CONNECTIONS_HEALTH_OR_QUOTA");
+      }
       return null;
     }
 
@@ -1475,15 +1492,24 @@ export async function getProviderCredentials(
       };
     }
 
-    const orderedConnections = withQuota;
+    let orderedConnections = withQuota;
 
     const providerStrategyOverrides = (settings.providerStrategies || {}) as Record<
       string,
       { fallbackStrategy?: string; stickyRoundRobinLimit?: number }
     >;
     const providerOverride = providerStrategyOverrides[resolvedId] || {};
-    const strategy =
-      providerOverride.fallbackStrategy || settings.fallbackStrategy || "fill-first";
+    const strategy = String(
+      providerOverride.fallbackStrategy || settings.fallbackStrategy || "fill-first"
+    );
+
+    const exclusiveSelection = filterExclusiveCredentialCandidates(
+      provider,
+      orderedConnections,
+      options
+    );
+    if (!Array.isArray(exclusiveSelection)) return exclusiveSelection;
+    orderedConnections = exclusiveSelection;
 
     let connection;
     const affinityConnection = await selectSessionAffinityConnection(
@@ -1640,6 +1666,17 @@ export async function getProviderCredentials(
       connection = orderedConnections[0];
     }
 
+    if (connection) {
+      const leasedConnection = acquireSelectedExclusiveCredential(
+        provider,
+        connection,
+        orderedConnections,
+        options
+      );
+      if (isExclusiveCapacityError(leasedConnection)) return leasedConnection;
+      connection = leasedConnection;
+    }
+
     if (provider === "antigravity" && connection) {
       log.info(
         "AUTH",
@@ -1688,6 +1725,7 @@ export async function getProviderCredentials(
       // getProviderCredentialsWithQuotaPreflight can see them. Without this,
       // user-set cutoffs would silently never enforce.
       quotaWindowThresholds: connection.quotaWindowThresholds ?? null,
+      exclusiveLeaseGeneration: getExclusiveLeaseGeneration(connection),
     };
   } finally {
     selectionLock.release();
@@ -1702,13 +1740,17 @@ export async function getProviderCredentialsWithQuotaPreflight(
   options: CredentialSelectionOptions = {}
 ) {
   if (options.bypassQuotaPolicy === true) {
-    return getProviderCredentials(
+    const credentials = await getProviderCredentials(
       provider,
       excludeConnectionId,
       allowedConnections,
       requestedModel,
       options
     );
+    if (!options.exclusiveSessionConnections) return credentials;
+    const failure = classifyExclusiveCredentialFailure(credentials);
+    if (failure) return failure;
+    return credentials;
   }
 
   const blockedByPreflight: Array<{
@@ -1748,11 +1790,15 @@ export async function getProviderCredentialsWithQuotaPreflight(
 
     if (!credentials) {
       if (blockedByPreflight.length > 0) {
-        return buildQuotaPreflightRateLimitedResult(provider, blockedByPreflight);
+        const blocked = buildQuotaPreflightRateLimitedResult(provider, blockedByPreflight);
+        return options.exclusiveSessionConnections
+          ? exclusiveCapacityError("NO_ELIGIBLE_CONNECTIONS_HEALTH_OR_QUOTA", blocked.retryAfter)
+          : blocked;
       }
-      return null;
+      return options.exclusiveSessionConnections
+        ? exclusiveCapacityError("ROUTE_CONFIG_UNCERTAINTY")
+        : null;
     }
-
     if (
       ("allRateLimited" in credentials && credentials.allRateLimited) ||
       ("allExpired" in credentials && credentials.allExpired)
@@ -1762,10 +1808,16 @@ export async function getProviderCredentialsWithQuotaPreflight(
         credentials.allRateLimited &&
         blockedByPreflight.length > 0
       ) {
-        return buildQuotaPreflightRateLimitedResult(provider, blockedByPreflight);
+        const blocked = buildQuotaPreflightRateLimitedResult(provider, blockedByPreflight);
+        return options.exclusiveSessionConnections
+          ? exclusiveCapacityError("NO_ELIGIBLE_CONNECTIONS_HEALTH_OR_QUOTA", blocked.retryAfter)
+          : blocked;
       }
-      return credentials;
+      return options.exclusiveSessionConnections
+        ? classifyExclusiveCredentialFailure(credentials)
+        : credentials;
     }
+    if (!credentials || isExclusiveCapacityError(credentials)) return credentials;
 
     const connectionId = credentials.connectionId;
     if (!connectionId) {
@@ -1849,6 +1901,15 @@ export async function getProviderCredentialsWithQuotaPreflight(
       preflight,
       requestedModel
     );
+    releaseSelectedExclusiveCredential({
+      options,
+      provider,
+      connectionId,
+      leaseGeneration:
+        (credentials as { exclusiveLeaseGeneration?: number | null }).exclusiveLeaseGeneration ??
+        null,
+      reason: "QUOTA_PREFLIGHT_BLOCKED",
+    });
     blockedByPreflight.push({
       id: connectionId,
       quotaPercent: preflight.quotaPercent,

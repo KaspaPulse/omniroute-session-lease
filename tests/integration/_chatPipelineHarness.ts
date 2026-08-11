@@ -283,17 +283,20 @@ export async function createChatPipelineHarness(prefix) {
     noLog = false,
     allowedConnections,
     allowedModels,
+    exclusiveSessionConnections = false,
   }: {
     name?: string;
     noLog?: boolean;
     allowedConnections?: any;
     allowedModels?: any;
+    exclusiveSessionConnections?: boolean;
   } = {}) {
     const key = await apiKeysDb.createApiKey(name, "machine-test");
     const updates: any = {};
     if (noLog) updates.noLog = true;
     if (allowedConnections) updates.allowedConnections = allowedConnections;
     if (allowedModels) updates.allowedModels = allowedModels;
+    if (exclusiveSessionConnections) updates.exclusiveSessionConnections = true;
     if (Object.keys(updates).length > 0) {
       await apiKeysDb.updateApiKeyPermissions(key.id, updates);
     }

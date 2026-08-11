@@ -3,9 +3,15 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import { z } from "zod";
 import { CodexExecutor } from "@omniroute/open-sse/executors/codex.ts";
 import { getApiKeyMetadata } from "@/lib/db/apiKeys";
+import { resolveQuotaKeyScope } from "@/lib/quota/quotaKey";
 import { authorizeWebSocketHandshake, extractWsTokenFromRequest } from "@/lib/ws/handshake";
 import { getModelInfo } from "@/sse/services/model";
-import { getProviderCredentialsWithQuotaPreflight } from "@/sse/services/auth";
+import {
+  extractSessionAffinityKey,
+  getProviderCredentialsWithQuotaPreflight,
+} from "@/sse/services/auth";
+import { exclusiveCapacityResponseForCredential } from "@/sse/handlers/exclusiveCapacityResponse";
+import * as exclusiveRouting from "@/sse/services/exclusiveChatRouting";
 import { enforceApiKeyPolicy } from "@/shared/utils/apiKeyPolicy";
 import { checkAndRefreshToken } from "@/sse/services/tokenRefresh";
 import { resolveCodexWsModelInfo } from "./modelResolution";
@@ -387,10 +393,18 @@ async function prepare(body: JsonRecord) {
 
   const metadata =
     policyResult.apiKeyInfo ?? (apiKey ? await getApiKeyMetadata(apiKey).catch(() => null) : null);
-  const allowedConnections =
-    metadata && Array.isArray(metadata.allowedConnections) && metadata.allowedConnections.length > 0
-      ? metadata.allowedConnections
-      : null;
+  const explicitSessionKey = extractSessionAffinityKey(null, authRequest.headers);
+  const affinity = exclusiveRouting.requireExclusiveExternalAffinity(
+    metadata,
+    explicitSessionKey,
+    explicitSessionKey ?? ""
+  );
+  if (affinity.rejection) return affinity.rejection;
+  const allowedConnections = await exclusiveRouting.resolveAllowedConnectionIds({
+    apiKeyInfo: metadata,
+    allowedConnectionIds: null,
+    resolveQuotaConnections: async (quotas) => (await resolveQuotaKeyScope(quotas)).connectionIds,
+  });
 
   // codex-only bridge: re-resolve bare ChatGPT model ids (the Codex CLI rejects
   // provider-prefixed ids client-side over WebSocket) as codex models.
@@ -410,8 +424,12 @@ async function prepare(body: JsonRecord) {
     provider,
     null,
     allowedConnections,
-    model
+    model,
+    exclusiveRouting.exclusiveCredentialOptions(metadata, affinity.sessionKey)
   );
+
+  const capacity = exclusiveCapacityResponseForCredential(credentials);
+  if (capacity) return capacity;
 
   if (!credentials || "allRateLimited" in credentials) {
     return jsonError(

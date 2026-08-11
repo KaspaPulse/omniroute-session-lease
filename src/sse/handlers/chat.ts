@@ -82,9 +82,9 @@ import {
   withSelectedConnectionHeader,
   withCorrelationId,
 } from "./chatHelpers";
+import { exclusiveCapacityResponseForCredential } from "./exclusiveCapacityResponse";
+import * as exclusiveRouting from "../services/exclusiveChatRouting";
 import { connectionHasExtraKeys } from "@omniroute/open-sse/services/apiKeyRotator.ts";
-
-// Pipeline integration — wired modules
 import { classify429FromError, type FailureKind } from "@/shared/utils/classify429";
 import { resolveUseUpstream429BreakerHints } from "@/shared/utils/providerHints";
 import { getCircuitBreaker, isLocalStreamLifecycleError } from "../../shared/utils/circuitBreaker";
@@ -184,25 +184,6 @@ async function getCombosCachedForChat(): Promise<unknown[]> {
   combosCacheVersionSnapshot = getCombosCacheVersion();
   combosCachePromise = getCombos().catch(() => []);
   return combosCachePromise;
-}
-
-function normalizeAllowedConnectionIds(value: unknown): string[] | null {
-  if (!Array.isArray(value)) return null;
-  const ids = value.filter(
-    (entry): entry is string => typeof entry === "string" && entry.trim().length > 0
-  );
-  return ids.length > 0 ? ids : null;
-}
-
-function intersectAllowedConnectionIds(primary: unknown, secondary: unknown): string[] | null {
-  const first = normalizeAllowedConnectionIds(primary);
-  const second = normalizeAllowedConnectionIds(secondary);
-
-  if (first && second) {
-    return first.filter((id) => second.includes(id));
-  }
-
-  return first || second || null;
 }
 
 const PROVIDER_BREAKER_FAILURE_STATUSES = new Set([408, 500, 502, 503, 504]);
@@ -424,11 +405,9 @@ export async function handleChat(
   // T04: client-provided external session header has priority over generated fingerprint.
   const externalSessionId = extractExternalSessionId(request.headers);
   const sessionId = externalSessionId || generateStableSessionId(body);
-  const sessionAffinityKey = extractSessionAffinityKey(body, request.headers) || sessionId;
+  const legacySessionAffinityKey = extractSessionAffinityKey(body, request.headers) || sessionId;
   const requestedConnectionId = request.headers.get("x-omniroute-connection")?.trim() || null;
-  if (sessionId) {
-    touchSession(sessionId);
-  }
+  if (sessionId) touchSession(sessionId);
 
   // Pipeline: API key policy enforcement (model restrictions + budget limits)
   telemetry.startPhase("policy");
@@ -441,6 +420,13 @@ export async function handleChat(
     return policy.rejection;
   }
   const apiKeyInfo = policy.apiKeyInfo;
+  const affinity = exclusiveRouting.requireExclusiveExternalAffinity(
+    apiKeyInfo,
+    extractSessionAffinityKey(null, request.headers),
+    legacySessionAffinityKey
+  );
+  if (affinity.rejection) return affinity.rejection;
+  const sessionAffinityKey = affinity.sessionKey!;
   const bypassProviderQuotaPolicy = hasProviderQuotaBypassScope(apiKeyInfo?.scopes);
   telemetry.endPhase();
 
@@ -693,6 +679,7 @@ export async function handleChat(
     // Pre-check function used by combo routing. For explicit combo live tests,
     // avoid pre-skipping so each model gets a real execution attempt.
     const comboPreselectedCredentials = new Map<string, any>();
+    const comboCapacity = exclusiveRouting.createExclusiveComboCapacityTracker();
     const getComboCredentialCacheKey = (
       modelString: string,
       target?: { connectionId?: string | null; executionKey?: string | null }
@@ -727,9 +714,7 @@ export async function handleChat(
       if (!provider) return true; // can't determine provider, let it try
 
       const resolvedModel = modelInfo.model || modelString;
-      const hasForcedConnection =
-        typeof target?.connectionId === "string" && target.connectionId.trim().length > 0;
-      let allowedConnections = intersectAllowedConnectionIds(
+      let allowedConnections = exclusiveRouting.intersectAllowedConnectionIds(
         apiKeyInfo?.allowedConnections ?? null,
         target?.allowedConnectionIds ?? null
       );
@@ -743,9 +728,21 @@ export async function handleChat(
         );
       }
 
-      if (Array.isArray(allowedConnections) && allowedConnections.length === 0) {
+      if (Array.isArray(allowedConnections) && allowedConnections.length === 0) return false;
+
+      if (
+        exclusiveRouting.comboTargetIsUnavailable({
+          apiKeyInfo,
+          sessionKey: sessionAffinityKey,
+          provider,
+          connectionId: target?.connectionId,
+          allowedConnectionIds: allowedConnections,
+        })
+      )
         return false;
-      }
+
+      // Defer exclusive atomic acquisition to execution; this probe stays read-only.
+      if (!exclusiveRouting.shouldPreselectExclusiveComboCredential(apiKeyInfo)) return true;
 
       const creds = await getProviderCredentialsWithQuotaPreflight(
         provider,
@@ -759,7 +756,7 @@ export async function handleChat(
           ...(bypassProviderQuotaPolicy ? { bypassQuotaPolicy: true } : {}),
         }
       );
-      if (!creds || creds.allRateLimited) return false;
+      if (exclusiveRouting.comboCredentialIsUnavailable(creds)) return false;
 
       comboPreselectedCredentials.set(getComboCredentialCacheKey(modelString, target), creds);
       return true;
@@ -792,9 +789,7 @@ export async function handleChat(
         : undefined;
     telemetry.endPhase();
 
-    // Context-relay keeps generation in combo.ts, but handoff injection lives here
-    // because only this layer knows which connectionId was actually selected.
-    const response = await (handleComboChat as any)({
+    let response = await (handleComboChat as any)({
       body,
       combo,
       handleSingleModel: (
@@ -840,7 +835,7 @@ export async function handleChat(
           target?.effectiveComboStrategy ?? combo.strategy,
           true
         ).then(async (res: Response) => {
-          // Auto-promote the winning combo model to position #1 (opt-in flag).
+          comboCapacity.observe(res);
           if (res?.ok)
             await promoteSuccessfulComboModel(
               combo,
@@ -859,9 +854,10 @@ export async function handleChat(
       signal: request?.signal ?? null,
       correlationId: reqId,
     });
+    response = comboCapacity.preserve(response);
+    if (response.headers.get("X-OmniRoute-Capacity-State")) return response;
 
     // ── Global Fallback Provider (#689) ────────────────────────────────────
-    // If combo exhausted all models, try the global fallback before giving up.
     if (
       !response.ok &&
       [502, 503].includes(response.status) &&
@@ -1101,20 +1097,11 @@ async function handleSingleModelChat(
   const hasForcedConnection =
     typeof runtimeOptions.forcedConnectionId === "string" &&
     runtimeOptions.forcedConnectionId.trim().length > 0;
-  let effectiveAllowedConnections = intersectAllowedConnectionIds(
-    apiKeyInfo?.allowedConnections ?? null,
-    runtimeOptions.allowedConnectionIds ?? null
-  );
-
-  // A4: quota-exclusive keys must only use the pool's connection(s).
-  if (apiKeyInfo?.allowedQuotas && apiKeyInfo.allowedQuotas.length > 0) {
-    const quotaScope = await resolveQuotaKeyScope(apiKeyInfo.allowedQuotas);
-    effectiveAllowedConnections = constrainConnectionsToQuota(
-      effectiveAllowedConnections ?? [],
-      quotaScope.connectionIds
-    );
-  }
-
+  const effectiveAllowedConnections = await exclusiveRouting.resolveAllowedConnectionIds({
+    apiKeyInfo,
+    allowedConnectionIds: runtimeOptions.allowedConnectionIds,
+    resolveQuotaConnections: async (quotas) => (await resolveQuotaKeyScope(quotas)).connectionIds,
+  });
   const bypassReason = forceLiveComboTest
     ? "combo live test"
     : hasForcedConnection
@@ -1230,7 +1217,10 @@ async function handleSingleModelChat(
               effectiveAllowedConnections,
               model,
               {
-                sessionKey: runtimeOptions.sessionAffinityKey ?? runtimeOptions.sessionId ?? null,
+                ...exclusiveRouting.exclusiveCredentialOptions(
+                  apiKeyInfo,
+                  runtimeOptions.sessionAffinityKey ?? runtimeOptions.sessionId
+                ),
                 excludeConnectionIds: Array.from(excludedConnectionIds),
                 ...(runtimeOptions.allowRateLimitedConnection
                   ? { allowRateLimitedConnections: true }
@@ -1252,6 +1242,8 @@ async function handleSingleModelChat(
       preselectedCredentials = null;
 
       if (!credentials || "allRateLimited" in credentials || !credentials.connectionId) {
+        const capacity = exclusiveCapacityResponseForCredential(credentials);
+        if (capacity) return capacity;
         if (credentials?.allRateLimited) {
           const retryDecision = getCooldownAwareRetryDecision({
             retryAfter: credentials.retryAfter,
@@ -1772,6 +1764,14 @@ async function handleSingleModelChat(
             // best-effort: selection also excludes this connection for the current retry.
           }
         }
+        exclusiveRouting.bestEffortReleaseFailedExclusiveChatLease(
+          apiKeyInfo,
+          runtimeOptions.sessionAffinityKey,
+          provider,
+          credentials.connectionId,
+          credentials.exclusiveLeaseGeneration,
+          result.status
+        );
         excludedConnectionIds.add(credentials.connectionId);
         lastError = result.error;
         lastStatus = result.status;

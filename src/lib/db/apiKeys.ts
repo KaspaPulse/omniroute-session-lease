@@ -81,6 +81,7 @@ interface ApiKeyMetadata {
   rateLimits: RateLimitRule[] | null;
   // T08: Per-key max concurrent sticky sessions (0 = unlimited)
   maxSessions: number;
+  exclusiveSessionConnections: boolean;
   // Phase 3 lifecycle/policy fields
   revokedAt: string | null;
   expiresAt: string | null;
@@ -138,6 +139,8 @@ interface ApiKeyRow extends JsonRecord {
   weeklyUsageLimitUsd?: unknown;
   chaos_mode_enabled?: unknown;
   chaosModeEnabled?: unknown;
+  exclusive_session_connections?: unknown;
+  exclusiveSessionConnections?: unknown;
 }
 
 interface StatementLike<TRow = unknown> {
@@ -185,6 +188,7 @@ interface ApiKeyView extends JsonRecord {
   dailyUsageLimitUsd?: number | null;
   weeklyUsageLimitUsd?: number | null;
   chaosModeEnabled?: boolean;
+  exclusiveSessionConnections?: boolean;
 }
 
 // LRU cache for API key validation (valid keys only)
@@ -398,7 +402,7 @@ function getPreparedStatements(db: ApiKeysDbLike): ApiKeysStatements {
       "SELECT id, expires_at, revoked_at, is_active, is_banned FROM api_keys WHERE key = ? OR key_hash = ?"
     );
     _stmtGetKeyMetadata = db.prepare<ApiKeyRow>(
-      "SELECT id, name, machine_id, allowed_models, blocked_models, allowed_combos, allowed_connections, allowed_quotas, no_log, auto_resolve, is_active, access_schedule, max_requests_per_day, max_requests_per_minute, throttle_delay_ms, max_sessions, revoked_at, expires_at, ip_allowlist, scopes, rate_limits, is_banned, key_hash, allowed_endpoints, stream_default_mode, disable_non_public_models, allow_usage_command, usage_limit_enabled, daily_usage_limit_usd, weekly_usage_limit_usd, chaos_mode_enabled, proxy_id FROM api_keys WHERE key = ? OR key_hash = ?"
+      "SELECT id, name, machine_id, allowed_models, blocked_models, allowed_combos, allowed_connections, allowed_quotas, no_log, auto_resolve, is_active, access_schedule, max_requests_per_day, max_requests_per_minute, throttle_delay_ms, max_sessions, exclusive_session_connections, revoked_at, expires_at, ip_allowlist, scopes, rate_limits, is_banned, key_hash, allowed_endpoints, stream_default_mode, disable_non_public_models, allow_usage_command, usage_limit_enabled, daily_usage_limit_usd, weekly_usage_limit_usd, chaos_mode_enabled, proxy_id FROM api_keys WHERE key = ? OR key_hash = ?"
     );
     _stmtInsertKey = db.prepare(
       "INSERT INTO api_keys (id, name, key, machine_id, allowed_models, no_log, created_at, key_prefix, key_hash, scopes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
@@ -452,6 +456,8 @@ export async function getApiKeys() {
     );
     camelRow.allowUsageCommand = parseAllowUsageCommand((camelRow as JsonRecord).allowUsageCommand);
     camelRow.chaosModeEnabled = parseChaosModeEnabled((camelRow as JsonRecord).chaosModeEnabled);
+    camelRow.exclusiveSessionConnections =
+      Number((camelRow as JsonRecord).exclusiveSessionConnections) === 1;
     Object.assign(camelRow, parseApiKeyUsageLimitFields(camelRow));
     if (typeof camelRow.id === "string" && camelRow.id.length > 0) {
       setNoLog(camelRow.id, camelRow.noLog === true);
@@ -485,10 +491,7 @@ export async function getApiKeys() {
  * inactive, or banned key, and it never widens a key's allowedModels.
  */
 export async function pickApiKeyForInternalUse(
-  purpose:
-    | "combo-health-check"
-    | "cloud-sync-verify"
-    | "internal-probe" = "internal-probe"
+  purpose: "combo-health-check" | "cloud-sync-verify" | "internal-probe" = "internal-probe"
 ): Promise<string | null> {
   try {
     const keys = (await getApiKeys()) as Array<{
@@ -506,29 +509,23 @@ export async function pickApiKeyForInternalUse(
 
     // 1. Management-scoped key (preferred for any internal probe).
     const manageKey = keys.find(
-      (k) =>
-        isUsable(k) && Array.isArray(k.scopes) && k.scopes.includes("manage"),
+      (k) => isUsable(k) && Array.isArray(k.scopes) && k.scopes.includes("manage")
     );
     if (manageKey?.key) return manageKey.key;
 
     // 2. Allow-all key (empty allowedModels means no model restrictions).
     const allowAllKey = keys.find(
-      (k) =>
-        isUsable(k) &&
-        Array.isArray(k.allowedModels) &&
-        k.allowedModels.length === 0,
+      (k) => isUsable(k) && Array.isArray(k.allowedModels) && k.allowedModels.length === 0
     );
     if (allowAllKey?.key) return allowAllKey.key;
 
     // 3. Most recently used (proxy for "the user actually wants this one
     //    working right now").
-    const byRecency = [...keys]
-      .filter(isUsable)
-      .sort((a, b) => {
-        const aT = typeof a.lastUsedAt === "number" ? a.lastUsedAt : 0;
-        const bT = typeof b.lastUsedAt === "number" ? b.lastUsedAt : 0;
-        return bT - aT;
-      });
+    const byRecency = [...keys].filter(isUsable).sort((a, b) => {
+      const aT = typeof a.lastUsedAt === "number" ? a.lastUsedAt : 0;
+      const bT = typeof b.lastUsedAt === "number" ? b.lastUsedAt : 0;
+      return bT - aT;
+    });
     if (byRecency[0]?.key) return byRecency[0].key;
 
     // 4. Legacy fallback: first active key. Keeps the function working
@@ -565,6 +562,8 @@ export async function getApiKeyById(id: string) {
   );
   camelRow.allowUsageCommand = parseAllowUsageCommand((camelRow as JsonRecord).allowUsageCommand);
   camelRow.chaosModeEnabled = parseChaosModeEnabled((camelRow as JsonRecord).chaosModeEnabled);
+  camelRow.exclusiveSessionConnections =
+    Number((camelRow as JsonRecord).exclusiveSessionConnections) === 1;
   Object.assign(camelRow, parseApiKeyUsageLimitFields(camelRow));
   if (typeof camelRow.id === "string" && camelRow.id.length > 0) {
     setNoLog(camelRow.id, camelRow.noLog === true);
@@ -682,6 +681,7 @@ export async function updateApiKeyPermissions(
         expiresAt?: string | null;
         // T08: max concurrent sessions for this key (0 = unlimited)
         maxSessions?: number | null;
+        exclusiveSessionConnections?: boolean;
         scopes?: string[] | null;
         proxyId?: string | null;
         allowedEndpoints?: string[] | null;
@@ -718,6 +718,8 @@ export async function updateApiKeyPermissions(
           isBanned: update.isBanned,
           expiresAt: update.expiresAt,
           maxSessions: (update as { maxSessions?: number | null }).maxSessions,
+          exclusiveSessionConnections: (update as { exclusiveSessionConnections?: boolean })
+            .exclusiveSessionConnections,
           scopes: (update as { scopes?: string[] | null }).scopes,
           proxyId: (update as { proxyId?: string | null }).proxyId,
           allowedEndpoints: (update as { allowedEndpoints?: string[] | null }).allowedEndpoints,
@@ -751,6 +753,7 @@ export async function updateApiKeyPermissions(
     normalized.isBanned === undefined &&
     normalized.expiresAt === undefined &&
     (normalized as Record<string, unknown>).maxSessions === undefined &&
+    (normalized as Record<string, unknown>).exclusiveSessionConnections === undefined &&
     (normalized as Record<string, unknown>).scopes === undefined &&
     (normalized as Record<string, unknown>).proxyId === undefined &&
     (normalized as Record<string, unknown>).allowedEndpoints === undefined &&
@@ -782,6 +785,7 @@ export async function updateApiKeyPermissions(
     rateLimits?: string | null;
     isBanned?: number;
     maxSessions?: number;
+    exclusiveSessionConnections?: number;
     expiresAt?: string | null;
     scopes?: string;
     proxyId?: string | null;
@@ -906,6 +910,13 @@ export async function updateApiKeyPermissions(
   if (maxSessionsUpdate !== undefined) {
     updates.push("max_sessions = @maxSessions");
     params.maxSessions = typeof maxSessionsUpdate === "number" ? Math.max(0, maxSessionsUpdate) : 0;
+  }
+
+  const exclusiveSessionConnectionsUpdate = (normalized as Record<string, unknown>)
+    .exclusiveSessionConnections;
+  if (exclusiveSessionConnectionsUpdate !== undefined) {
+    updates.push("exclusive_session_connections = @exclusiveSessionConnections");
+    params.exclusiveSessionConnections = exclusiveSessionConnectionsUpdate === true ? 1 : 0;
   }
 
   const proxyIdUpdate = (normalized as Record<string, unknown>).proxyId;
@@ -1272,6 +1283,7 @@ export async function getApiKeyMetadata(
       maxRequestsPerMinute: null,
       throttleDelayMs: null,
       maxSessions: 0,
+      exclusiveSessionConnections: false,
       revokedAt: null,
       expiresAt: null,
       ipAllowlist: [],
@@ -1314,6 +1326,8 @@ export async function getApiKeyMetadata(
   const rawThrottleDelayMs = record.throttle_delay_ms ?? (record as JsonRecord).throttleDelayMs;
 
   const rawMaxSessions = record.max_sessions ?? record.maxSessions;
+  const rawExclusiveSessionConnections =
+    record.exclusive_session_connections ?? record.exclusiveSessionConnections;
 
   const metadata: ApiKeyMetadata = {
     id: metadataId,
@@ -1339,6 +1353,8 @@ export async function getApiKeyMetadata(
       typeof rawThrottleDelayMs === "number" && rawThrottleDelayMs > 0 ? rawThrottleDelayMs : null,
     // T08: max concurrent sessions; 0 = unlimited (default & backward-compatible)
     maxSessions: typeof rawMaxSessions === "number" && rawMaxSessions > 0 ? rawMaxSessions : 0,
+    exclusiveSessionConnections:
+      rawExclusiveSessionConnections === true || Number(rawExclusiveSessionConnections) === 1,
     revokedAt: parseNullableTimestamp(record.revoked_at ?? (record as JsonRecord).revokedAt),
     expiresAt: parseNullableTimestamp(record.expires_at ?? (record as JsonRecord).expiresAt),
     ipAllowlist: parseStringList(record.ip_allowlist ?? (record as JsonRecord).ipAllowlist),

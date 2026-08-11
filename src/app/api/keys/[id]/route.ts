@@ -76,6 +76,7 @@ export async function PATCH(request, { params }) {
       isBanned,
       expiresAt,
       maxSessions,
+      exclusiveSessionConnections,
       accessSchedule,
       rateLimits,
       scopes,
@@ -102,6 +103,9 @@ export async function PATCH(request, { params }) {
     if (isBanned !== undefined) payload.isBanned = isBanned;
     if (expiresAt !== undefined) payload.expiresAt = expiresAt;
     if (maxSessions !== undefined) payload.maxSessions = maxSessions;
+    if (exclusiveSessionConnections !== undefined) {
+      payload.exclusiveSessionConnections = exclusiveSessionConnections;
+    }
     if (accessSchedule !== undefined) payload.accessSchedule = accessSchedule;
     if (rateLimits !== undefined) payload.rateLimits = rateLimits;
     if (scopes !== undefined) payload.scopes = scopes;
@@ -137,6 +141,7 @@ export async function PATCH(request, { params }) {
       ...(isBanned !== undefined && { isBanned }),
       ...(expiresAt !== undefined && { expiresAt }),
       ...(maxSessions !== undefined && { maxSessions }),
+      ...(exclusiveSessionConnections !== undefined && { exclusiveSessionConnections }),
       ...(accessSchedule !== undefined && { accessSchedule }),
       ...(rateLimits !== undefined && { rateLimits }),
       ...(scopes !== undefined && { scopes }),

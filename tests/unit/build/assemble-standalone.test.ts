@@ -144,6 +144,32 @@ test("async and sync sidecar copy paths produce identical bundle trees", async (
   fs.rmSync(tmp, { recursive: true, force: true });
 });
 
+test("in-place assembly tolerates a symlinked dependency tree", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "assemble-in-place-symlink-"));
+  const dependencyRoot = path.join(tmp, "shared-node-modules");
+  const projectRoot = path.join(tmp, "project");
+  const distDir = path.join(projectRoot, ".build/next");
+  const standaloneDir = path.join(distDir, "standalone");
+  fs.mkdirSync(path.join(dependencyRoot, "wreq-js/rust"), { recursive: true });
+  fs.writeFileSync(path.join(dependencyRoot, "wreq-js/rust/lib.so"), "native");
+  fs.mkdirSync(standaloneDir, { recursive: true });
+  fs.writeFileSync(path.join(standaloneDir, "server.js"), "// server");
+  fs.symlinkSync(dependencyRoot, path.join(projectRoot, "node_modules"), "dir");
+  fs.symlinkSync(dependencyRoot, path.join(standaloneDir, "node_modules"), "dir");
+
+  assert.doesNotThrow(() =>
+    assembleStandalone({
+      distDir,
+      outDir: standaloneDir,
+      projectRoot,
+      sanitizePaths: false,
+      copyNatives: true,
+    })
+  );
+  assert.equal(fs.readFileSync(path.join(dependencyRoot, "wreq-js/rust/lib.so"), "utf8"), "native");
+  fs.rmSync(tmp, { recursive: true, force: true });
+});
+
 test("the TPROXY addon source is skipped gracefully when it was not built (non-Linux)", async () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "assemble-skip-"));
   const projectRoot = path.join(tmp, "src-root");
