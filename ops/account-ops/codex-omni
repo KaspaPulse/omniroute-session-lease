@@ -20,6 +20,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
+import urllib.parse
 import uuid
 from pathlib import Path
 from typing import Any
@@ -189,6 +191,60 @@ def parse_env_key(path: Path) -> str:
         if len(parsed) == 1 and parsed[0]:
             return parsed[0]
     raise RuntimeError("continuity API key is missing")
+
+
+def profile_file_for(profile: str) -> Path:
+    if profile == PROFILE:
+        return PROFILE_FILE
+    config = load_json(ACCOUNTS_FILE, {})
+    accounts = config.get("accounts") if isinstance(config, dict) else None
+    if isinstance(accounts, list):
+        for account in accounts:
+            if not isinstance(account, dict):
+                continue
+            if str(account.get("profile") or "") != profile:
+                continue
+            configured = account.get("profile_file")
+            if configured:
+                return Path(str(configured)).expanduser().resolve()
+            break
+    return Path("/home") / LOCAL_OWNER_NAME / ".codex" / f"{profile}.config.toml"
+
+
+def lease_base_url(profile: str) -> str:
+    path = profile_file_for(profile)
+    if not private_regular(path):
+        raise RuntimeError("managed Codex profile must be a private regular file")
+    try:
+        with path.open("rb") as handle:
+            config = tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise RuntimeError("managed Codex profile cannot be parsed") from error
+    providers = config.get("model_providers")
+    providers = providers if isinstance(providers, dict) else {}
+    provider = providers.get("omniroute")
+    provider = provider if isinstance(provider, dict) else {}
+    raw = str(provider.get("base_url") or "").strip()
+    parsed = urllib.parse.urlsplit(raw)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise RuntimeError("managed Codex profile has an invalid OmniRoute base_url")
+    route_path = parsed.path.rstrip("/")
+    if not route_path.endswith("/v1"):
+        raise RuntimeError("managed Codex profile OmniRoute base_url must end in /v1")
+    lease_path = route_path[:-3].rstrip("/")
+    endpoint = urllib.parse.urlunsplit(
+        (parsed.scheme, parsed.netloc, lease_path, "", "")
+    ).rstrip("/")
+    if not endpoint:
+        raise RuntimeError("managed Codex profile has an empty OmniRoute lease endpoint")
+    return endpoint
 
 
 def configured_connections() -> dict[str, str]:
@@ -942,6 +998,7 @@ def launch(arguments: list[str]) -> int:
     environment = os.environ.copy()
     environment["OMNIROUTE_API_KEY"] = key
     environment["CODEX_OMNI_SESSION_AFFINITY"] = affinity
+    environment["OMNIROUTE_BASE_URL"] = lease_base_url(effective_profile)
     common_options = [
         "-p",
         effective_profile,
