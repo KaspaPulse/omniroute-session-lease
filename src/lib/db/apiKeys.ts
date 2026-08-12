@@ -625,6 +625,71 @@ export async function createApiKey(name: string, machineId: string, scopes: stri
   return apiKey;
 }
 
+export async function createManagedExclusiveApiKey(
+  name: string,
+  machineId: string,
+  policy: {
+    allowedModels: string[];
+    allowedConnections: string[];
+    allowedCombos?: string[];
+    autoResolve?: boolean;
+    maxSessions?: number;
+    allowUsageCommand?: boolean;
+    scopes?: string[];
+  }
+) {
+  if (!machineId) {
+    throw new Error("machineId is required");
+  }
+  const normalizePolicyList = (value: unknown): string[] =>
+    Array.isArray(value)
+      ? value.filter(
+          (entry): entry is string => typeof entry === "string" && entry.trim().length > 0
+        )
+      : [];
+  const allowedModels = normalizePolicyList(policy.allowedModels);
+  const allowedConnections = normalizePolicyList(policy.allowedConnections);
+  if (allowedModels.length === 0 || allowedConnections.length === 0) {
+    throw new Error("Managed exclusive API keys require model and connection restrictions");
+  }
+
+  const db = getDbInstance() as ApiKeysDbLike;
+  const now = new Date().toISOString();
+  const { generateApiKeyWithMachine } = await import("@/shared/utils/apiKey");
+  const generated = generateApiKeyWithMachine(machineId);
+  const id = uuidv4();
+  const keyHash = await hashKey(generated.key);
+  const scopes = parseStringList(policy.scopes ?? ["self:usage"]);
+
+  getPreparedStatements(db);
+  db.prepare(
+    `INSERT INTO api_keys
+      (id, name, key, machine_id, allowed_models, allowed_combos, allowed_connections,
+       no_log, created_at, key_prefix, key_hash, scopes, auto_resolve, max_sessions,
+       is_active, allow_usage_command, exclusive_session_connections)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, 1, ?, 1)`
+  ).run(
+    id,
+    name,
+    generated.key,
+    machineId,
+    JSON.stringify(allowedModels),
+    JSON.stringify(normalizePolicyList(policy.allowedCombos ?? [])),
+    JSON.stringify(allowedConnections),
+    now,
+    generated.key.slice(0, 12),
+    keyHash,
+    JSON.stringify(scopes),
+    policy.autoResolve === true ? 1 : 0,
+    Math.max(0, Math.floor(policy.maxSessions ?? 1)),
+    policy.allowUsageCommand === false ? 0 : 1
+  );
+  invalidateCaches();
+  setNoLog(id, false);
+  backupDbFile("pre-write");
+  return { id, key: generated.key, name, machineId };
+}
+
 export async function regenerateApiKey(id: string) {
   const db = getDbInstance() as ApiKeysDbLike;
   const stmt = getPreparedStatements(db);

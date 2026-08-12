@@ -67,6 +67,22 @@ test("nine owners get nine distinct connections and the tenth waits", () => {
   }
 });
 
+for (const count of [1, 2, 5]) {
+  test(`${count} owners get ${count} distinct connections`, () => {
+    const connections = Array.from({ length: count }, (_, index) => `connection-${index + 1}`);
+    const allocated = Array.from({ length: count }, (_, index) =>
+      acquire(`session-${index + 1}`, connections)
+    );
+    assert.ok(allocated.every((result) => result.kind === "acquired"));
+    assert.equal(
+      new Set(
+        allocated.map((result) => (result.kind === "acquired" ? result.lease.connectionId : null))
+      ).size,
+      count
+    );
+  });
+}
+
 test("release returns capacity to a waiter without sharing", () => {
   const first = acquire("session-1", ["connection-1"]);
   assert.equal(first.kind, "acquired");

@@ -127,6 +127,7 @@ function sanitizeApiKeyForSync(apiKey: unknown): JsonRecord {
     "maxRequestsPerMinute",
     "throttleDelayMs",
     "maxSessions",
+    "exclusiveSessionConnections",
   ]);
 }
 

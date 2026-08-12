@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { getApiKeys, createApiKey, isCloudEnabled, updateApiKeyPermissions } from "@/lib/localDb";
+import { createManagedExclusiveApiKey } from "@/lib/db/apiKeys";
 import { getConsistentMachineId } from "@/shared/utils/machineId";
 import { syncToCloud } from "@/lib/cloudSync";
 import { createKeySchema } from "@/shared/validation/schemas";
@@ -72,12 +73,19 @@ export async function POST(request) {
       dailyUsageLimitUsd,
       weeklyUsageLimitUsd,
       chaosModeEnabled,
+      managedExclusivePolicy,
     } = validation.data;
 
     // Always get machineId from server
     const machineId = await getConsistentMachineId();
     const normalizedScopes = normalizeSelfServiceScopesForCreate(scopes);
-    const apiKey = await createApiKey(name, machineId, normalizedScopes);
+    const apiKey = managedExclusivePolicy
+      ? await createManagedExclusiveApiKey(name, machineId, {
+          ...managedExclusivePolicy,
+          allowUsageCommand: allowUsageCommand !== false,
+          scopes: normalizedScopes,
+        })
+      : await createApiKey(name, machineId, normalizedScopes);
     if (
       noLog === true ||
       allowUsageCommand === true ||

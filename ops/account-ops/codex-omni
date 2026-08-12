@@ -1,0 +1,1033 @@
+#!/usr/bin/env python3
+"""OmniRoute-native Codex continuity launcher (no PTY scraping or supervision)."""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import fcntl
+import hashlib
+import json
+import os
+import grp
+import pwd
+import re
+import shlex
+import signal
+import sqlite3
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+from pathlib import Path
+from typing import Any
+
+
+MODEL = "gpt-5.6-sol"
+MODEL_ALIASES = {MODEL, f"cx/{MODEL}", f"codex/{MODEL}"}
+REASONING = "xhigh"
+PROFILE = "omniroute-continuity"
+ARCHITECTURE = "NATIVE_PROXY_CONTINUITY"
+SCHEMA_VERSION = 1
+EXIT_WAITING = 75
+EXIT_CONFIG = 78
+MAX_HANDOFFS = 9
+HARD_UNAVAILABLE_STATUSES = {
+    "AUTH_INVALID",
+    "BUSY",
+    "DEACTIVATED",
+    "DISABLED",
+    "QUOTA_EXHAUSTED",
+    "RATE_LIMITED",
+}
+
+TEST_MODE = os.environ.get("CODEX_OMNI_TEST_MODE") == "1"
+STATE_ROOT = Path(
+    os.environ.get("CODEX_OMNI_STATE_ROOT", "/var/lib/omniroute/codex-continuity")
+)
+DB_FILE = Path(os.environ.get("CODEX_OMNI_DB", "/opt/omniroute/data/storage.sqlite"))
+OPS_STATE_FILE = Path(
+    os.environ.get(
+        "CODEX_OMNI_OPS_STATE", "/opt/omniroute/account-ops/state/account-state.json"
+    )
+)
+ACCOUNTS_FILE = Path(
+    os.environ.get("CODEX_OMNI_ACCOUNTS", "/opt/omniroute/account-ops/accounts.json")
+)
+ENV_FILE = Path(
+    os.environ.get(
+        "CODEX_OMNI_ENV_FILE", "/home/kas/.config/omniroute/codex-continuity.env"
+    )
+)
+PROFILE_FILE = Path(
+    os.environ.get(
+        "CODEX_OMNI_PROFILE_FILE", "/home/kas/.codex/omniroute-continuity.config.toml"
+    )
+)
+CODEX_BIN = Path(os.environ.get("CODEX_OMNI_CODEX_BIN", "/home/kas/.local/bin/codex"))
+LEASE_HELPER = Path(
+    os.environ.get(
+        "CODEX_OMNI_LEASE_HELPER",
+        "/home/kas/.local/libexec/omniroute/codex-omni-exclusive-lease.py",
+    )
+)
+SESSIONS_ROOT = Path(
+    os.environ.get("CODEX_OMNI_SESSIONS_ROOT", "/home/kas/.codex/sessions")
+)
+POOL_KEY_NAME = "codex-omni-continuity-pool"
+LOCAL_OWNER_NAME = os.environ.get("CODEX_OMNI_LOCAL_OWNER", "kas")
+
+
+def utcnow() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def iso_now() -> str:
+    return utcnow().isoformat().replace("+00:00", "Z")
+
+
+def parse_ts(value: Any) -> dt.datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = dt.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def load_json(path: Path, default: Any = None) -> Any:
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return default
+
+
+def ensure_state_root() -> None:
+    STATE_ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(STATE_ROOT, 0o700)
+    (STATE_ROOT / "runs").mkdir(mode=0o700, exist_ok=True)
+    os.chmod(STATE_ROOT / "runs", 0o700)
+
+
+def atomic_json(path: Path, value: dict[str, Any]) -> None:
+    ensure_state_root()
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, sort_keys=True, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def run_path(run_id: str) -> Path:
+    return STATE_ROOT / "runs" / f"{run_id}.json"
+
+
+def load_manifest(run_id: str) -> dict[str, Any] | None:
+    value = load_json(run_path(run_id))
+    return value if isinstance(value, dict) else None
+
+
+def write_manifest(value: dict[str, Any]) -> None:
+    value["updated_at"] = iso_now()
+    atomic_json(run_path(str(value["run_id"])), value)
+    atomic_json(
+        STATE_ROOT / "latest.json",
+        {
+            "schema_version": SCHEMA_VERSION,
+            "run_id": value["run_id"],
+            "status": value["status"],
+            "updated_at": value["updated_at"],
+        },
+    )
+
+
+def latest_manifest() -> dict[str, Any] | None:
+    pointer = load_json(STATE_ROOT / "latest.json")
+    if not isinstance(pointer, dict) or not isinstance(pointer.get("run_id"), str):
+        return None
+    return load_manifest(pointer["run_id"])
+
+
+def parse_env_key(path: Path) -> str:
+    mode = path.stat().st_mode & 0o777
+    if not path.is_file() or mode & 0o077:
+        raise RuntimeError("continuity environment file must be a private regular file")
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("export OMNIROUTE_API_KEY="):
+            value = stripped.split("=", 1)[1]
+        elif stripped.startswith("OMNIROUTE_API_KEY="):
+            value = stripped.split("=", 1)[1]
+        else:
+            continue
+        parsed = shlex.split(value)
+        if len(parsed) == 1 and parsed[0]:
+            return parsed[0]
+    raise RuntimeError("continuity API key is missing")
+
+
+def configured_connections() -> dict[str, str]:
+    config = load_json(ACCOUNTS_FILE, {})
+    accounts = config.get("accounts") if isinstance(config, dict) else None
+    if not isinstance(accounts, list):
+        return {}
+    names = [
+        str(account.get("connection") or "")
+        for account in accounts
+        if isinstance(account, dict) and account.get("connection")
+    ]
+    if not names:
+        return {}
+    connection = sqlite3.connect(f"file:{DB_FILE}?mode=ro", uri=True, timeout=5)
+    try:
+        placeholders = ",".join("?" for _ in names)
+        rows = connection.execute(
+            f"SELECT id,name FROM provider_connections WHERE provider='codex' AND name IN ({placeholders})",
+            names,
+        ).fetchall()
+        return {str(name): str(connection_id) for connection_id, name in rows}
+    finally:
+        connection.close()
+
+
+def route_snapshot() -> list[dict[str, Any]]:
+    configured = configured_connections()
+    state = load_json(OPS_STATE_FILE, {})
+    account_state = state.get("accounts") if isinstance(state, dict) else {}
+    account_state = account_state if isinstance(account_state, dict) else {}
+    if not configured:
+        return []
+    connection = sqlite3.connect(f"file:{DB_FILE}?mode=ro", uri=True, timeout=5)
+    connection.row_factory = sqlite3.Row
+    try:
+        placeholders = ",".join("?" for _ in configured.values())
+        rows = connection.execute(
+            f"""
+            SELECT id,name,is_active,test_status,rate_limited_until,error_code,last_error_type
+            FROM provider_connections WHERE id IN ({placeholders})
+            """,
+            list(configured.values()),
+        ).fetchall()
+    finally:
+        connection.close()
+    now = utcnow()
+    result = []
+    for row in rows:
+        ops = account_state.get(str(row["name"]))
+        ops = ops if isinstance(ops, dict) else {}
+        limited_until = parse_ts(row["rate_limited_until"])
+        db_ready = bool(
+            int(row["is_active"] or 0) == 1
+            and str(row["test_status"] or "").lower() == "active"
+            and (limited_until is None or limited_until <= now)
+        )
+        ops_status = str(ops.get("status") or "UNKNOWN").upper()
+        # NEEDS_REVIEW is an operational-verification state, not evidence that
+        # native proxy capacity is exhausted.  If OmniRoute itself still marks
+        # the connection active and outside cooldown, allow its request-time
+        # health/failover path to decide.  Hard unavailability remains closed.
+        ready = db_ready and ops_status not in HARD_UNAVAILABLE_STATUSES
+        result.append(
+            {
+                "connection_id": str(row["id"]),
+                "connection": str(row["name"]),
+                "status": "READY" if ops_status == "READY" and ready else ops_status,
+                "ready": ready,
+                "readiness_source": (
+                    "DB_AND_OPS"
+                    if ready and ops_status == "READY"
+                    else "DB_ACTIVE_OPS_REVIEW"
+                    if ready
+                    else "UNAVAILABLE"
+                ),
+                "rate_limited_until": limited_until.isoformat() if limited_until else None,
+                "error_code": row["error_code"],
+                "error_type": row["last_error_type"],
+            }
+        )
+    return sorted(result, key=lambda value: value["connection"])
+
+
+def capacity_assessment(routes: list[dict[str, Any]]) -> tuple[str, str]:
+    """Classify route evidence without turning uncertainty into exhaustion."""
+    if any(bool(route.get("ready")) for route in routes):
+        return "READY", "AT_LEAST_ONE_NATIVE_ROUTE_USABLE"
+    if not routes:
+        return "UNVERIFIED", "EMPTY_ROUTE_SNAPSHOT"
+    statuses = {str(route.get("status") or "UNKNOWN").upper() for route in routes}
+    if statuses <= {"NEEDS_REVIEW", "UNKNOWN"}:
+        return "UNVERIFIED", "OPS_REVIEW_ONLY_SNAPSHOT"
+    if all(status in HARD_UNAVAILABLE_STATUSES for status in statuses):
+        return "EXHAUSTED", "ALL_ROUTES_AUTHORITATIVELY_UNAVAILABLE"
+    return "UNVERIFIED", "MIXED_OR_INCONCLUSIVE_ROUTE_SNAPSHOT"
+
+
+def clear_waiting_marker(run_id: str) -> None:
+    marker = STATE_ROOT / "runs" / f"{run_id}.waiting"
+    try:
+        marker.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def invalidate_false_waiting(
+    manifest: dict[str, Any], routes: list[dict[str, Any]], reason: str
+) -> None:
+    manifest["status"] = "CAPACITY_UNVERIFIED"
+    manifest["handoff_reason"] = reason
+    manifest["classification"] = "ROUTE_STATE_REQUIRES_REVIEW"
+    manifest["retry_at"] = None
+    manifest["route_snapshot"] = routes
+    manifest["waiting_invalidated_at"] = iso_now()
+    write_manifest(manifest)
+    clear_waiting_marker(str(manifest["run_id"]))
+
+
+def git_metadata(cwd: Path) -> dict[str, Any]:
+    def git(*arguments: str) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.run(
+            ["git", "-C", str(cwd), *arguments],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+
+    root_result = git("rev-parse", "--show-toplevel")
+    if root_result.returncode != 0:
+        return {
+            "root": None,
+            "branch": None,
+            "head": None,
+            "dirty": False,
+            "status_digest": None,
+            "recent_commits": [],
+        }
+    root = root_result.stdout.decode("utf-8", "replace").strip()
+    branch = git("branch", "--show-current").stdout.decode("utf-8", "replace").strip() or None
+    head = git("rev-parse", "HEAD").stdout.decode("ascii", "replace").strip() or None
+    status = git("status", "--porcelain=v1", "-z", "--untracked-files=normal").stdout
+    recent = git("log", "-5", "--format=%H").stdout.decode("ascii", "replace").splitlines()
+    return {
+        "root": root,
+        "branch": branch,
+        "head": head,
+        "dirty": bool(status),
+        "status_digest": hashlib.sha256(status).hexdigest(),
+        "recent_commits": recent,
+    }
+
+
+def session_candidates(cwd: Path, since_epoch: float = 0) -> list[tuple[float, str]]:
+    candidates: list[tuple[float, str]] = []
+    if not SESSIONS_ROOT.is_dir():
+        return candidates
+    for path in SESSIONS_ROOT.glob("*/*/*/rollout-*.jsonl"):
+        try:
+            modified = path.stat().st_mtime
+            if modified + 2 < since_epoch:
+                continue
+            with path.open("r", encoding="utf-8") as handle:
+                first = json.loads(handle.readline())
+            payload = first.get("payload") if isinstance(first, dict) else None
+            payload = payload if isinstance(payload, dict) else first
+            if not isinstance(payload, dict):
+                continue
+            session_id = payload.get("id")
+            session_cwd = payload.get("cwd")
+            if isinstance(session_id, str) and session_cwd == str(cwd):
+                candidates.append((modified, session_id))
+        except (OSError, ValueError):
+            continue
+    return sorted(candidates, reverse=True)
+
+
+def newest_session(cwd: Path, since_epoch: float = 0) -> str | None:
+    candidates = session_candidates(cwd, since_epoch)
+    return candidates[0][1] if candidates else None
+
+
+def resolve_connection_name(connection_id: str | None) -> str | None:
+    if not connection_id:
+        return None
+    try:
+        connection = sqlite3.connect(f"file:{DB_FILE}?mode=ro", uri=True, timeout=5)
+        row = connection.execute(
+            "SELECT name FROM provider_connections WHERE id=?", (connection_id,)
+        ).fetchone()
+        connection.close()
+        return str(row[0]) if row else None
+    except sqlite3.Error:
+        return None
+
+
+def affinity_connection(affinity: str) -> str | None:
+    try:
+        connection = sqlite3.connect(f"file:{DB_FILE}?mode=ro", uri=True, timeout=5)
+        row = connection.execute(
+            "SELECT connection_id FROM session_account_affinity WHERE session_key=? AND provider='codex'",
+            (f"header:{affinity}",),
+        ).fetchone()
+        if row is None:
+            row = connection.execute(
+                "SELECT connection_id FROM session_account_affinity WHERE session_key=? AND provider='codex'",
+                (affinity,),
+            ).fetchone()
+        connection.close()
+        return str(row[0]) if row else None
+    except sqlite3.Error:
+        return None
+
+
+def terminal_429_since(started_iso: str, connection_ids: list[str]) -> bool:
+    if not connection_ids:
+        return False
+    try:
+        connection = sqlite3.connect(f"file:{DB_FILE}?mode=ro", uri=True, timeout=5)
+        placeholders = ",".join("?" for _ in connection_ids)
+        row = connection.execute(
+            f"""
+            SELECT 1 FROM call_logs
+            WHERE connection_id IN ({placeholders}) AND timestamp>=? AND status=429
+            LIMIT 1
+            """,
+            [*connection_ids, started_iso],
+        ).fetchone()
+        connection.close()
+        return row is not None
+    except sqlite3.Error:
+        return False
+
+
+def internal_monitor(run_id: str, child_pid: int) -> int:
+    manifest = load_manifest(run_id)
+    if not manifest:
+        return EXIT_CONFIG
+    started_epoch = float(manifest.get("started_epoch") or time.time())
+    started_iso = str(manifest.get("started_at") or iso_now())
+    affinity = str(manifest.get("affinity_id") or "")
+    cwd = Path(str(manifest.get("cwd") or "/"))
+    previous_connection = manifest.get("selected_connection_id")
+    while Path(f"/proc/{child_pid}").exists():
+        manifest = load_manifest(run_id) or manifest
+        session_id = newest_session(cwd, started_epoch - 2)
+        if session_id and manifest.get("codex_session_id") != session_id:
+            manifest["codex_session_id"] = session_id
+            write_manifest(manifest)
+
+        current_connection = affinity_connection(affinity)
+        if current_connection and current_connection != previous_connection:
+            if previous_connection:
+                manifest["handoff_count"] = int(manifest.get("handoff_count") or 0) + 1
+                manifest["handoff_reason"] = "TERMINAL_429_NATIVE_ROTATION"
+                manifest["old_connection"] = resolve_connection_name(str(previous_connection))
+                manifest["new_connection"] = resolve_connection_name(current_connection)
+                manifest["last_successful_continuation_at"] = iso_now()
+            manifest["selected_connection_id"] = current_connection
+            manifest["selected_connection"] = resolve_connection_name(current_connection)
+            previous_connection = current_connection
+            write_manifest(manifest)
+
+        routes = route_snapshot()
+        route_ids = [str(route["connection_id"]) for route in routes]
+        ready = [route for route in routes if route["ready"]]
+        capacity_state, capacity_reason = capacity_assessment(routes)
+        loop_guard = int(manifest.get("handoff_count") or 0) >= int(
+            manifest.get("max_handoffs") or MAX_HANDOFFS
+        )
+        has_429 = terminal_429_since(started_iso, route_ids)
+        if has_429 and (capacity_state == "EXHAUSTED" or loop_guard):
+            future = [
+                parse_ts(route.get("rate_limited_until"))
+                for route in routes
+                if parse_ts(route.get("rate_limited_until"))
+            ]
+            manifest["status"] = "WAITING_FOR_CAPACITY"
+            manifest["handoff_reason"] = "MAX_HANDOFF_LOOP_GUARD" if loop_guard else "ALL_ROUTES_UNAVAILABLE"
+            manifest["classification"] = "TRANSIENT_RATE_LIMIT_OR_QUOTA_WINDOW"
+            manifest["retry_at"] = min(future).isoformat() if future else None
+            manifest["route_snapshot"] = routes
+            write_manifest(manifest)
+            marker = STATE_ROOT / "runs" / f"{run_id}.waiting"
+            marker.write_text("WAITING_FOR_CAPACITY\n", encoding="utf-8")
+            os.chmod(marker, 0o600)
+            try:
+                os.kill(child_pid, signal.SIGINT)
+            except ProcessLookupError:
+                return 0
+            for _ in range(25):
+                if not Path(f"/proc/{child_pid}").exists():
+                    return 0
+                time.sleep(0.2)
+            try:
+                os.kill(child_pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            return 0
+        if has_429 and not ready and capacity_state == "UNVERIFIED":
+            invalidate_false_waiting(manifest, routes, capacity_reason)
+            try:
+                os.kill(child_pid, signal.SIGINT)
+            except ProcessLookupError:
+                return 0
+            return 0
+        time.sleep(2)
+    return 0
+
+
+def pending_waiting_manifest() -> dict[str, Any] | None:
+    latest = latest_manifest()
+    if latest and latest.get("status") in {"WAITING_FOR_CAPACITY", "CAPACITY_AVAILABLE"}:
+        return latest
+    return None
+
+
+def capacity_maintain_command() -> int:
+    pending = pending_waiting_manifest()
+    if not pending:
+        print("STATUS=NO_WAITING_RUN")
+        print("MODEL_REQUESTS=0")
+        return 0
+    routes = route_snapshot()
+    ready = [route for route in routes if route["ready"]]
+    capacity_state, capacity_reason = capacity_assessment(routes)
+    if not ready:
+        if capacity_state == "UNVERIFIED":
+            invalidate_false_waiting(pending, routes, capacity_reason)
+            print("STATUS=CAPACITY_UNVERIFIED")
+            print(f"DETAIL={capacity_reason}")
+            print(f"STATE_PATH={run_path(str(pending['run_id']))}")
+            print("MODEL_REQUESTS=0")
+            return EXIT_CONFIG
+        print("STATUS=WAITING_FOR_CAPACITY")
+        print(f"STATE_PATH={run_path(str(pending['run_id']))}")
+        print("MODEL_REQUESTS=0")
+        return 0
+    pending["status"] = "CAPACITY_AVAILABLE"
+    pending["capacity_available_at"] = iso_now()
+    pending["route_snapshot"] = routes
+    write_manifest(pending)
+    print("STATUS=CAPACITY_AVAILABLE")
+    print(f"STATE_PATH={run_path(str(pending['run_id']))}")
+    print("ACTION=RUN_CODEX_OMNI_TO_CONTINUE")
+    print("MODEL_REQUESTS=0")
+    return 0
+
+
+def safe_continuation_prompt(manifest: dict[str, Any]) -> str:
+    task = manifest.get("task_file") or "none"
+    state = manifest.get("project_state_file") or "none"
+    path = run_path(str(manifest["run_id"]))
+    return (
+        "Continue the existing task; do not restart it. First inspect the filesystem, Git state, "
+        f"checkpoint file ({state}), task file ({task}), and continuity manifest ({path}). "
+        "Preserve completed work; never reset, clean, or checkout over user changes. Do not repeat "
+        "already-green expensive tests unless relevant source changed. Before repeating any deploy, "
+        "migration, Git publish, message, mail, or other external mutation, inspect receipts/current "
+        "state and use idempotency. Verify the final outcome."
+    )
+
+
+def initial_task_prompt(task: Path, state: Path | None) -> str:
+    state_clause = f" Use {state} as the durable checkpoint file." if state else ""
+    return (
+        f"Read {task} and execute it fully as the authoritative task.{state_clause} "
+        "Preserve existing repository state and verify the completed outcome."
+    )
+
+
+def status_command() -> int:
+    manifest = latest_manifest()
+    if not manifest:
+        print("STATUS=NO_CONTINUITY_RUN")
+        return 0
+    routes = route_snapshot()
+    print(f"STATUS={manifest.get('status', 'UNKNOWN')}")
+    print(f"RUN_ID={manifest.get('run_id', '')}")
+    print(f"CWD={manifest.get('cwd', '')}")
+    print(f"CONNECTION={manifest.get('selected_connection') or 'UNPINNED'}")
+    print(f"READY_ROUTES={sum(1 for route in routes if route['ready'])}")
+    print(f"BUSY_ROUTES={sum(1 for route in routes if not route['ready'])}")
+    print(f"HANDOFF_COUNT={manifest.get('handoff_count', 0)}")
+    print(f"CONTINUITY_MODE={manifest.get('continuity_mode', 'NATIVE_IN_SESSION')}")
+    print(f"SESSION_ID={manifest.get('codex_session_id') or 'UNKNOWN'}")
+    print(f"RETRY_AT={manifest.get('retry_at') or 'NONE'}")
+    print(f"STATE_PATH={run_path(str(manifest['run_id']))}")
+    return 0
+
+
+def private_regular(path: Path, executable: bool = False) -> bool:
+    try:
+        stat_result = path.stat(follow_symlinks=False)
+    except OSError:
+        return False
+    if not path.is_file() or stat_result.st_mode & 0o022:
+        return False
+    if executable and not stat_result.st_mode & 0o100:
+        return False
+    return True
+
+
+def _local_identity() -> tuple[int, set[int]] | None:
+    try:
+        account = pwd.getpwnam(LOCAL_OWNER_NAME)
+    except KeyError:
+        return None
+    groups = {account.pw_gid}
+    groups.update(
+        entry.gr_gid for entry in grp.getgrall() if account.pw_name in entry.gr_mem
+    )
+    return account.pw_uid, groups
+
+
+def _private_owner_group(owner_uid: int, group_gid: int) -> bool:
+    """Allow group write only when the group is private to the file owner."""
+    try:
+        account = pwd.getpwuid(owner_uid)
+        group = grp.getgrgid(group_gid)
+    except KeyError:
+        return False
+    if account.pw_gid != group_gid or group.gr_name != account.pw_name:
+        return False
+    if any(member != account.pw_name for member in group.gr_mem):
+        return False
+    return all(
+        entry.pw_uid == owner_uid
+        for entry in pwd.getpwall()
+        if entry.pw_gid == group_gid
+    )
+
+
+def _trusted_mode(metadata: os.stat_result) -> bool:
+    if metadata.st_mode & 0o002:
+        return False
+    if metadata.st_mode & 0o020 and not _private_owner_group(
+        metadata.st_uid, metadata.st_gid
+    ):
+        return False
+    return True
+
+
+def _identity_can_execute(
+    metadata: os.stat_result, user_uid: int, group_gids: set[int]
+) -> bool:
+    if metadata.st_uid == user_uid:
+        return bool(metadata.st_mode & stat.S_IXUSR)
+    if metadata.st_gid in group_gids:
+        return bool(metadata.st_mode & stat.S_IXGRP)
+    return bool(metadata.st_mode & stat.S_IXOTH)
+
+
+def _trusted_parent_chain(
+    path: Path, allowed_owner_uids: set[int], user_uid: int, group_gids: set[int]
+) -> bool:
+    current = path.parent
+    while True:
+        try:
+            metadata = current.stat()
+        except OSError:
+            return False
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid not in allowed_owner_uids
+            or not _trusted_mode(metadata)
+            or not _identity_can_execute(metadata, user_uid, group_gids)
+        ):
+            return False
+        if current == current.parent:
+            return True
+        current = current.parent
+
+
+def trusted_executable(path: Path) -> bool:
+    """Validate a regular executable or a symlink to one without weakening trust."""
+    identity = _local_identity()
+    if identity is None:
+        return False
+    user_uid, group_gids = identity
+    allowed_owner_uids = {0, user_uid}
+    lexical_path = Path(os.path.abspath(path))
+    try:
+        link_metadata = lexical_path.lstat()
+    except OSError:
+        return False
+    if stat.S_ISLNK(link_metadata.st_mode):
+        if link_metadata.st_uid not in allowed_owner_uids:
+            return False
+    try:
+        # Resolve even a regular leaf so symlinked parent directories are
+        # validated through their actual target path as well.
+        resolved = lexical_path.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return False
+    try:
+        target_metadata = resolved.stat()
+    except OSError:
+        return False
+    return bool(
+        stat.S_ISREG(target_metadata.st_mode)
+        and target_metadata.st_uid in allowed_owner_uids
+        and _trusted_mode(target_metadata)
+        and _identity_can_execute(target_metadata, user_uid, group_gids)
+        and _trusted_parent_chain(
+            lexical_path, allowed_owner_uids, user_uid, group_gids
+        )
+        and _trusted_parent_chain(resolved, allowed_owner_uids, user_uid, group_gids)
+    )
+
+
+def validate_pool_key() -> tuple[bool, str]:
+    try:
+        key = parse_env_key(ENV_FILE)
+        configured_ids = set(configured_connections().values())
+        connection = sqlite3.connect(f"file:{DB_FILE}?mode=ro", uri=True, timeout=5)
+        row = connection.execute(
+            """
+            SELECT allowed_models,allowed_connections,is_active,is_banned,revoked_at,
+                   exclusive_session_connections
+            FROM api_keys WHERE name=? AND (key=? OR key_hash=?)
+            """,
+            (POOL_KEY_NAME, key, hashlib.sha256(key.encode()).hexdigest()),
+        ).fetchone()
+        connection.close()
+        if not row:
+            return False, "pooled API key is not registered"
+        models = set(json.loads(row[0] or "[]"))
+        connections = set(json.loads(row[1] or "[]"))
+        valid = bool(
+            models == MODEL_ALIASES
+            and connections == configured_ids
+            and int(row[2] or 0) == 1
+            and int(row[3] or 0) == 0
+            and not row[4]
+            and int(row[5] or 0) == 1
+        )
+        return valid, "OK" if valid else "pooled API key restrictions do not match config"
+    except (OSError, ValueError, sqlite3.Error, RuntimeError) as error:
+        return False, str(error)
+
+
+def doctor_command() -> int:
+    checks: list[tuple[str, bool, str]] = []
+    checks.append(("CODEX_BINARY", trusted_executable(CODEX_BIN), str(CODEX_BIN)))
+    checks.append(("PROFILE_PRIVATE", private_regular(PROFILE_FILE), str(PROFILE_FILE)))
+    checks.append(("ENV_PRIVATE", private_regular(ENV_FILE), str(ENV_FILE)))
+    profile_text = PROFILE_FILE.read_text(encoding="utf-8") if PROFILE_FILE.is_file() else ""
+    checks.append(("RESPONSES_API", 'wire_api = "responses"' in profile_text, "responses"))
+    checks.append(("XHIGH", 'model_reasoning_effort = "xhigh"' in profile_text, REASONING))
+    checks.append(("EXTERNAL_AFFINITY", "X-Session-Id" in profile_text, "env_http_headers"))
+    pool_ok, pool_detail = validate_pool_key()
+    checks.append(("POOL_RESTRICTIONS", pool_ok, pool_detail))
+    try:
+        db_ok = sqlite3.connect(f"file:{DB_FILE}?mode=ro", uri=True).execute(
+            "PRAGMA quick_check"
+        ).fetchone()[0] == "ok"
+    except sqlite3.Error:
+        db_ok = False
+    checks.append(("DATABASE", db_ok, "quick_check"))
+    checks.append(("ROUTES_CONFIGURED", len(route_snapshot()) > 1, str(len(route_snapshot()))))
+    checks.append(("STATE_PERMISSIONS", (STATE_ROOT.stat().st_mode & 0o777) == 0o700, str(STATE_ROOT)))
+    for name, ok, detail in checks:
+        print(f"CHECK_{name}={'PASS' if ok else 'FAIL'} DETAIL={detail}")
+    print("MODEL_REQUESTS=0")
+    result = all(ok for _, ok, _ in checks)
+    print(f"DOCTOR={'GREEN' if result else 'RED'}")
+    return 0 if result else 1
+
+
+def dry_run_command() -> int:
+    routes = route_snapshot()
+    ready = [route for route in routes if route["ready"]]
+    print(f"CODEX_ACCOUNT_SELECTED={'NATIVE_POOL' if ready else 'NONE'}")
+    print(f"STATUS={'READY' if ready else 'NO_READY_ACCOUNT'}")
+    print(f"MODEL={MODEL}")
+    print(f"REASONING={REASONING}")
+    print("SESSION_PINNING=EXTERNAL_AFFINITY_WITH_FAILED_PIN_EVICTION")
+    print("MODEL_REQUESTS=0")
+    return 0 if ready else 3
+
+
+def parse_args(arguments: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--task")
+    parser.add_argument("--state")
+    parser.add_argument("--wait-for-capacity", action="store_true")
+    parser.add_argument("--max-handoffs", type=int, default=MAX_HANDOFFS)
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--managed-profile")
+    parser.add_argument("--managed-env-file")
+    parser.add_argument("--help", action="store_true")
+    known, codex_args = parser.parse_known_args(arguments)
+    known.codex_args = codex_args
+    return known
+
+
+def print_help() -> None:
+    print(
+        "usage: codex-omni [--task FILE] [--state FILE] [CODEX_ARGS...]\n"
+        "       codex-omni status\n"
+        "       codex-omni doctor\n\n"
+        "Native OmniRoute continuity preserves the live Responses request across 429 account rotation.\n"
+        "A parked WAITING_FOR_CAPACITY run is resumed explicitly on a later launch."
+    )
+
+
+def launch(arguments: list[str]) -> int:
+    options = parse_args(arguments)
+    if options.help:
+        print_help()
+        return 0
+    if options.dry_run:
+        return dry_run_command()
+    if options.max_handoffs < 1 or options.max_handoffs > 50:
+        raise RuntimeError("--max-handoffs must be between 1 and 50")
+    if bool(options.managed_profile) != bool(options.managed_env_file):
+        raise RuntimeError("--managed-profile and --managed-env-file must be used together")
+    effective_profile = options.managed_profile or PROFILE
+    effective_env_file = (
+        Path(options.managed_env_file).resolve()
+        if options.managed_env_file
+        else ENV_FILE
+    )
+    if options.managed_profile and not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", effective_profile):
+        raise RuntimeError("invalid managed profile")
+    if not private_regular(effective_env_file):
+        raise RuntimeError("managed environment file must be a private regular file")
+    if not private_regular(LEASE_HELPER):
+        raise RuntimeError("exclusive lease helper must be a trusted regular file")
+    task = Path(options.task).resolve() if options.task else None
+    project_state = Path(options.state).resolve() if options.state else None
+    if task and (not task.is_file() or not os.access(task, os.R_OK)):
+        raise RuntimeError("--task must name a readable regular file")
+    if project_state and project_state.exists() and not project_state.is_file():
+        raise RuntimeError("--state must name a regular file or a not-yet-created file")
+
+    pending = pending_waiting_manifest()
+    if pending and (task or project_state):
+        pending_task = pending.get("task_file")
+        pending_state = pending.get("project_state_file")
+        same_task = not task or pending_task == str(task)
+        same_state = not project_state or pending_state == str(project_state)
+        if not (same_task and same_state):
+            pending = None
+    routes = route_snapshot()
+    ready = [route for route in routes if route["ready"]]
+    capacity_state, capacity_reason = capacity_assessment(routes)
+    if pending and not ready:
+        if capacity_state == "UNVERIFIED":
+            invalidate_false_waiting(pending, routes, capacity_reason)
+            print("STATUS=CAPACITY_UNVERIFIED")
+            print(f"DETAIL={capacity_reason}")
+            print(f"STATE_PATH={run_path(str(pending['run_id']))}")
+            return EXIT_CONFIG
+        print("STATUS=WAITING_FOR_CAPACITY")
+        print(f"STATE_PATH={run_path(str(pending['run_id']))}")
+        print(f"RETRY_AT={pending.get('retry_at') or 'UNKNOWN'}")
+        return EXIT_WAITING
+    if not ready:
+        if capacity_state == "UNVERIFIED":
+            print("STATUS=CAPACITY_UNVERIFIED")
+            print(f"DETAIL={capacity_reason}")
+            print("ACTION=RECONCILE_OR_REVIEW_ROUTE_CONFIGURATION")
+            return EXIT_CONFIG
+        run_id = str(uuid.uuid4())
+        cwd = Path.cwd().resolve()
+        manifest = {
+            "schema_version": SCHEMA_VERSION,
+            "run_id": run_id,
+            "architecture": ARCHITECTURE,
+            "status": "WAITING_FOR_CAPACITY",
+            "created_at": iso_now(),
+            "started_at": iso_now(),
+            "started_epoch": time.time(),
+            "cwd": str(cwd),
+            "model": MODEL,
+            "reasoning": REASONING,
+            "continuity_mode": "NEW_SESSION",
+            "task_file": str(task) if task else None,
+            "project_state_file": str(project_state) if project_state else None,
+            "git": git_metadata(cwd),
+            "handoff_count": 0,
+            "max_handoffs": options.max_handoffs,
+            "handoff_reason": "NO_READY_ROUTE_AT_LAUNCH",
+            "route_snapshot": routes,
+            "retry_at": None,
+        }
+        write_manifest(manifest)
+        print("STATUS=WAITING_FOR_CAPACITY")
+        print(f"STATE_PATH={run_path(run_id)}")
+        return EXIT_WAITING
+
+    key = parse_env_key(effective_env_file)
+    cwd = Path(str(pending.get("cwd"))) if pending and pending.get("cwd") else Path.cwd().resolve()
+    if not cwd.is_dir():
+        raise RuntimeError("saved continuity cwd no longer exists")
+    task = task or (Path(str(pending["task_file"])) if pending and pending.get("task_file") else None)
+    project_state = project_state or (
+        Path(str(pending["project_state_file"]))
+        if pending and pending.get("project_state_file")
+        else None
+    )
+    run_id = str(uuid.uuid4())
+    affinity = f"codex-omni-{run_id}"
+    prior_session = (
+        str(pending.get("codex_session_id"))
+        if pending and pending.get("codex_session_id")
+        else None
+    )
+    mode = "RESUME" if prior_session else ("NEW_SESSION_HANDOFF" if pending else "NEW_SESSION")
+    now = iso_now()
+    manifest = {
+        "schema_version": SCHEMA_VERSION,
+        "run_id": run_id,
+        "predecessor_run_id": pending.get("run_id") if pending else None,
+        "architecture": ARCHITECTURE,
+        "status": "RUNNING",
+        "created_at": now,
+        "started_at": now,
+        "started_epoch": time.time(),
+        "cwd": str(cwd),
+        "launcher_mode": (
+            "MANAGED_NAMED"
+            if options.managed_profile
+            else "DURABLE_TASK"
+            if task or project_state
+            else "INTERACTIVE"
+        ),
+        "launcher_argv": ["--task", str(task)] if task else [],
+        "model": MODEL,
+        "reasoning": REASONING,
+        "affinity_id": affinity,
+        "continuity_mode": mode,
+        "codex_session_id": prior_session,
+        "selected_connection": None,
+        "selected_connection_id": None,
+        "task_file": str(task) if task else None,
+        "project_state_file": str(project_state) if project_state else None,
+        "git": git_metadata(cwd),
+        "handoff_count": 0,
+        "max_handoffs": options.max_handoffs,
+        "handoff_reason": "CAPACITY_RETURNED" if pending else None,
+        "classification": None,
+        "retry_at": None,
+        "last_successful_continuation_at": now if pending else None,
+        "route_snapshot": routes,
+    }
+    write_manifest(manifest)
+
+    environment = os.environ.copy()
+    environment["OMNIROUTE_API_KEY"] = key
+    environment["CODEX_OMNI_SESSION_AFFINITY"] = affinity
+    common_options = [
+        "-p",
+        effective_profile,
+        "--model",
+        MODEL,
+        "--config",
+        'model_reasoning_effort="xhigh"',
+        "--sandbox",
+        "danger-full-access",
+        "--ask-for-approval",
+        "never",
+        "-C",
+        str(cwd),
+    ]
+    if prior_session:
+        command = [str(CODEX_BIN), "resume", *common_options, prior_session, *options.codex_args]
+    elif pending:
+        command = [str(CODEX_BIN), *common_options, *options.codex_args, safe_continuation_prompt(pending)]
+    elif task:
+        command = [str(CODEX_BIN), *common_options, *options.codex_args, initial_task_prompt(task, project_state)]
+    else:
+        command = [str(CODEX_BIN), *common_options, *options.codex_args]
+
+    print("CODEX_ACCOUNT_SELECTED=NATIVE_POOL")
+    print("STATUS=READY")
+    print(f"MODEL={MODEL}")
+    print(f"REASONING={REASONING}")
+    print("AUTO_FAILOVER=ENABLED")
+    print(f"CONTINUITY_MODE={mode}")
+    print(f"STATE_PATH={run_path(run_id)}")
+    leased_command = [sys.executable, str(LEASE_HELPER), "run", "--", *command]
+    child = subprocess.Popen(leased_command, cwd=cwd, env=environment)
+    monitor = subprocess.Popen(
+        [sys.executable, str(Path(__file__).resolve()), "--internal-monitor", run_id, str(child.pid)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        return_code = child.wait()
+    except KeyboardInterrupt:
+        return_code = child.wait()
+    finally:
+        monitor.terminate()
+        try:
+            monitor.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            monitor.kill()
+            monitor.wait()
+
+    manifest = load_manifest(run_id) or manifest
+    waiting_marker = STATE_ROOT / "runs" / f"{run_id}.waiting"
+    if (
+        return_code == EXIT_WAITING
+        or waiting_marker.exists()
+        or manifest.get("status") == "WAITING_FOR_CAPACITY"
+    ):
+        manifest["status"] = "WAITING_FOR_CAPACITY"
+        manifest["exit_code"] = return_code
+        manifest["git_after"] = git_metadata(cwd)
+        write_manifest(manifest)
+        print("STATUS=WAITING_FOR_CAPACITY")
+        print(f"RETRY_AT={manifest.get('retry_at') or 'UNKNOWN'}")
+        return EXIT_WAITING
+    manifest["status"] = "COMPLETED" if return_code == 0 else "INTERRUPTED"
+    manifest["exit_code"] = return_code
+    manifest["codex_session_id"] = newest_session(cwd, float(manifest["started_epoch"]) - 2) or manifest.get("codex_session_id")
+    manifest["git_after"] = git_metadata(cwd)
+    write_manifest(manifest)
+    return return_code
+
+
+def main() -> int:
+    if len(sys.argv) >= 2 and sys.argv[1] == "--internal-monitor":
+        return internal_monitor(sys.argv[2], int(sys.argv[3]))
+    if len(sys.argv) == 2 and sys.argv[1] == "status":
+        return status_command()
+    if len(sys.argv) == 2 and sys.argv[1] == "maintain":
+        return capacity_maintain_command()
+    if len(sys.argv) == 2 and sys.argv[1] in {"doctor", "--self-test"}:
+        return doctor_command()
+    try:
+        return launch(sys.argv[1:])
+    except (OSError, RuntimeError, ValueError) as error:
+        print(f"STATUS=CONFIGURATION_ERROR DETAIL={error}", file=sys.stderr)
+        return EXIT_CONFIG
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

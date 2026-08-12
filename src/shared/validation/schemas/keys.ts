@@ -27,6 +27,15 @@ export const createKeySchema = z.object({
   weeklyUsageLimitUsd: z.coerce.number().min(0).optional().nullable(),
   chaosModeEnabled: z.boolean().optional(),
   scopes: z.array(z.string().trim().min(1).max(64)).max(32).optional(),
+  managedExclusivePolicy: z
+    .object({
+      allowedModels: z.array(z.string().trim().min(1).max(256)).min(1).max(1000),
+      allowedConnections: z.array(z.string().uuid()).min(1).max(100),
+      allowedCombos: z.array(z.string().trim().min(1).max(200)).max(500).optional(),
+      autoResolve: z.boolean().optional(),
+      maxSessions: z.number().int().min(0).max(10000).optional(),
+    })
+    .optional(),
 });
 
 export const createSyncTokenSchema = z.object({
