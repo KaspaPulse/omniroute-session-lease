@@ -13,6 +13,11 @@ import {
   clearConnectionErrorIfUnchanged,
 } from "@/lib/db/providers";
 import { validateApiKey } from "@/lib/db/apiKeys";
+import {
+  getActiveExclusiveConnectionLease,
+  hashLeaseOwnerId,
+  type ExclusiveConnectionLease,
+} from "@/lib/db/exclusiveConnectionLeases";
 import { getSettings } from "@/lib/db/settings";
 import { toNumber } from "@/shared/utils/numeric";
 import {
@@ -88,6 +93,7 @@ import {
   resolveForcedConnectionForCredentialPool,
   resolveSessionAffinityTtlMs,
   selectSessionAffinityConnection,
+  planSessionAffinityConnection,
   syncSessionAffinityRuntimeFields,
 } from "./sessionAffinityPin";
 import {
@@ -99,7 +105,17 @@ import { getNoAuthHydrationProviderIds } from "./noAuthProviderSiblings";
 import { getResource404Bypass } from "./requestResourceHealth";
 import { isVertexConnectionWidePermissionDenied } from "./vertexErrorClassifier";
 import * as log from "../utils/logger";
-import { fisherYatesShuffle, getNextFromDeckSync } from "@/shared/utils/shuffleDeck";
+import {
+  fisherYatesShuffle,
+  getNextFromDeckSync,
+  planNextFromDeckSync,
+} from "@/shared/utils/shuffleDeck";
+import {
+  applyExclusiveConnectionLeasePolicy,
+  invalidateManagedConnectionLease,
+  mutateExclusiveConnectionLease,
+  type CredentialLeaseSelectionContext,
+} from "./exclusiveConnectionLeasePolicy";
 import { readHeaderValue, type AuthRequestHeaders } from "./headerReader.ts";
 import {
   getOAuthSessionAvailability,
@@ -116,7 +132,7 @@ interface RecoverableConnectionState {
   lastErrorType?: string | null;
   lastErrorSource?: string | null;
 }
-interface CredentialSelectionOptions {
+export interface CredentialSelectionOptions {
   allowSuppressedConnections?: boolean;
   allowRateLimitedConnections?: boolean;
   bypassQuotaPolicy?: boolean;
@@ -125,7 +141,19 @@ interface CredentialSelectionOptions {
   sessionKey?: string | null;
   sessionAffinityTtlMs?: number | null;
   reserveOAuthSession?: boolean;
+  lease?: CredentialLeaseSelectionContext;
+  materializeCredentials?: boolean;
+  deferLeaseClaim?: boolean;
+  /** Internal: a same-call UNIQUE retry already holds the provider/owner selection lock. */
+  _leaseRetryWithLockHeld?: boolean;
+  /** Internal: freeze the original policy-valid candidate set across lease race/preflight retry. */
+  _leaseCandidateIds?: string[];
 }
+export type ExclusiveLeaseSelectionResult = {
+  exclusiveLease: ExclusiveConnectionLease;
+  connectionId: string;
+  provider: string;
+};
 interface CooldownInspectionState {
   connection: ProviderConnectionView;
   connectionCooldownMs: number | null;
@@ -927,6 +955,7 @@ function getSelectionMutexKey(provider: string, options: CredentialSelectionOpti
   return [
     resolveProviderId(provider) || provider,
     options.forcedConnectionId ? `forced:${options.forcedConnectionId}` : "pool",
+    options.lease ? `lease:${hashLeaseOwnerId(options.lease.context.leaseOwnerId)}` : "unmanaged",
   ].join(":");
 }
 function createSelectionLock(key: string) {
@@ -1011,6 +1040,74 @@ async function getProviderSearchPool(provider: string): Promise<string[]> {
   return Array.from(searchPool);
 }
 
+function invalidateManagedLease(
+  options: CredentialSelectionOptions,
+  reason: Parameters<typeof invalidateManagedConnectionLease>[1]
+) {
+  invalidateManagedConnectionLease(options.lease, reason);
+}
+
+type DeferredLeaseSelection = {
+  commitSelectionSideEffects?: () => Promise<void> | void;
+  selectNextLeaseCandidate?: (excludedConnectionId: string) => Promise<unknown>;
+};
+
+function planLastUsedCommit(
+  connection: ProviderConnectionView,
+  connections: ProviderConnectionView[],
+  count: number
+) {
+  const now = new Date().toISOString();
+  return async () => {
+    await touchConnectionLastUsed(connection.id, count);
+    connection.lastUsedAt = now;
+    connection.consecutiveUseCount = count;
+    syncSessionAffinityRuntimeFields(connections, connection);
+  };
+}
+
+function materializeConnection(
+  connection: ProviderConnectionView,
+  options: CredentialSelectionOptions,
+  extra: DeferredLeaseSelection & { exclusiveLease?: ExclusiveConnectionLease } = {}
+) {
+  const apiKeyHealth = connection.providerSpecificData?.apiKeyHealth as
+    Record<string, KeyHealth> | undefined;
+  if (apiKeyHealth) syncHealthFromDB(connection.id, apiKeyHealth);
+  const releaseOAuthSession =
+    options.reserveOAuthSession === true && connection.authType === "oauth" && options.sessionKey
+      ? reserveOAuthSession(connection.id, options.sessionKey)
+      : undefined;
+  return {
+    apiKey: connection.apiKey,
+    accessToken: connection.accessToken,
+    refreshToken: connection.refreshToken,
+    expiresAt: connection.tokenExpiresAt || connection.expiresAt || null,
+    projectId: connection.projectId,
+    defaultModel: connection.defaultModel || null,
+    copilotToken:
+      typeof connection.providerSpecificData.copilotToken === "string"
+        ? connection.providerSpecificData.copilotToken
+        : null,
+    providerSpecificData: connection.providerSpecificData,
+    id: connection.id,
+    provider: connection.provider,
+    authType: connection.authType,
+    email: connection.email,
+    connectionId: connection.id,
+    testStatus: connection.testStatus,
+    lastError: connection.lastError,
+    lastErrorType: connection.lastErrorType,
+    lastErrorSource: connection.lastErrorSource,
+    errorCode: connection.errorCode,
+    rateLimitedUntil: connection.rateLimitedUntil,
+    maxConcurrent: connection.maxConcurrent,
+    quotaWindowThresholds: connection.quotaWindowThresholds ?? null,
+    ...(releaseOAuthSession ? { releaseOAuthSession } : {}),
+    ...extra,
+  };
+}
+
 /**
  * Get provider credentials from localDb
  * Filters out unavailable accounts and returns the selected account based on strategy
@@ -1024,10 +1121,12 @@ export async function getProviderCredentials(
   requestedModel: string | null = null,
   options: CredentialSelectionOptions = {}
 ) {
-  const selectionLock = createSelectionLock(getSelectionMutexKey(provider, options));
+  const selectionLock = options._leaseRetryWithLockHeld
+    ? null
+    : createSelectionLock(getSelectionMutexKey(provider, options));
 
   try {
-    await selectionLock.wait;
+    await selectionLock?.wait;
 
     // No-auth providers (e.g. opencode) need no DB connection — return synthetic credentials
     // so the executor receives a valid credentials object without auth headers being added.
@@ -1099,23 +1198,33 @@ export async function getProviderCredentials(
     if (allowedConnections && allowedConnections.length > 0) {
       connections = connections.filter((conn) => allowedConnections.includes(conn.id));
     }
+    const forcedConnectionEligible = connections.some((conn) => conn.id === forcedConnectionId);
+    if (options.lease && forcedConnectionId && !forcedConnectionEligible) return null;
+    if (options.lease?.mode === "request" && forcedConnectionId) {
+      const activeLease = getActiveExclusiveConnectionLease(options.lease.context.leaseOwnerId);
+      if (activeLease && activeLease.connectionId !== forcedConnectionId) {
+        return { leaseConnectionMismatch: true };
+      }
+    }
 
     // #5903: an active session-affinity pin outranks a per-request reset-aware
     // forcedConnectionId (see sessionAffinityPin leaf for the full rationale).
-    forcedConnectionId =
-      applySessionAffinityPin({
-        forcedConnectionId,
-        options,
-        sessionAffinityTtlMs,
-        connections,
-        provider,
-        requestedModel,
-        excludedConnectionIds,
-        isTerminalConnectionStatus,
-        isCodexScopeUnavailable,
-        isQuotaPolicyBlocked: (c) =>
-          evaluateQuotaLimitPolicy(provider, c as ProviderConnectionView, requestedModel).blocked,
-      }) ?? forcedConnectionId;
+    if (!options.lease) {
+      forcedConnectionId =
+        applySessionAffinityPin({
+          forcedConnectionId,
+          options,
+          sessionAffinityTtlMs,
+          connections,
+          provider,
+          requestedModel,
+          excludedConnectionIds,
+          isTerminalConnectionStatus,
+          isCodexScopeUnavailable,
+          isQuotaPolicyBlocked: (c) =>
+            evaluateQuotaLimitPolicy(provider, c as ProviderConnectionView, requestedModel).blocked,
+        }) ?? forcedConnectionId;
+    }
 
     forcedConnectionId = resolveForcedConnectionForCredentialPool({
       forcedConnectionId,
@@ -1180,6 +1289,7 @@ export async function getProviderCredentials(
             "AUTH",
             `${provider} | all ${allConnections.length} accounts rate limited (${formatRetryAfter(earliest)})`
           );
+          invalidateManagedLease(options, "HEALTH_OR_COOLDOWN");
           return {
             allRateLimited: true,
             retryAfter: earliest,
@@ -1202,6 +1312,7 @@ export async function getProviderCredentials(
         // the dashboard sees a misleading "bad_request" code.
         const terminalConnections = allConnections.filter(isTerminalConnectionStatus);
         if (terminalConnections.length === allConnections.length) {
+          invalidateManagedLease(options, "AUTHORIZATION_CHANGED");
           const syntheticFallback = await maybeSyntheticNoAuthFallback(
             resolvedId,
             excludedConnectionIds,
@@ -1229,6 +1340,7 @@ export async function getProviderCredentials(
         allowedConnections
       );
       if (syntheticFallback) return syntheticFallback;
+      invalidateManagedLease(options, "CONNECTION_INELIGIBLE");
       log.warn("AUTH", `No credentials for ${provider}`);
       return null;
     }
@@ -1428,6 +1540,10 @@ export async function getProviderCredentials(
             ? `${provider} | all ${connections.length} active accounts cooling down for model ${requestedModel} (${formatRetryAfter(earliest)}) | lastErrorCode=${earliestConn?.errorCode}, lastError=${earliestConn?.lastError?.slice(0, 50)}`
             : `${provider} | all ${connections.length} active accounts rate limited (${formatRetryAfter(earliest)}) | lastErrorCode=${earliestConn?.errorCode}, lastError=${earliestConn?.lastError?.slice(0, 50)}`
         );
+        invalidateManagedLease(
+          options,
+          allBlockedByModelCooldown ? "MODEL_INELIGIBLE" : "HEALTH_OR_COOLDOWN"
+        );
         return {
           allRateLimited: true,
           retryAfter: earliest,
@@ -1445,6 +1561,7 @@ export async function getProviderCredentials(
         allowedConnections
       );
       if (syntheticFallback) return syntheticFallback;
+      invalidateManagedLease(options, "CONNECTION_INELIGIBLE");
       log.warn("AUTH", `${provider} | all ${connections.length} accounts unavailable`);
       return null;
     }
@@ -1491,6 +1608,7 @@ export async function getProviderCredentials(
         ? new Date(earliestResetMs).toISOString()
         : new Date(Date.now() + 5 * 60 * 1000).toISOString();
 
+      invalidateManagedLease(options, "QUOTA_UNAVAILABLE");
       return {
         allRateLimited: true,
         retryAfter,
@@ -1534,6 +1652,7 @@ export async function getProviderCredentials(
         ? new Date(earliestResetMs).toISOString()
         : new Date(Date.now() + 5 * 60 * 1000).toISOString();
 
+      invalidateManagedLease(options, "QUOTA_UNAVAILABLE");
       return {
         allRateLimited: true,
         retryAfter,
@@ -1543,7 +1662,30 @@ export async function getProviderCredentials(
       };
     }
 
-    const orderedConnections = [...withQuota].sort((a, b) => {
+    const policyValidLeaseCandidates = options._leaseCandidateIds
+      ? withQuota.filter((candidate) => options._leaseCandidateIds!.includes(candidate.id))
+      : withQuota;
+    if (policyValidLeaseCandidates.length === 0) return null;
+    const leasePolicy = await applyExclusiveConnectionLeasePolicy(
+      policyValidLeaseCandidates,
+      options
+    );
+    if (leasePolicy.error) return { [leasePolicy.error]: true };
+    if (leasePolicy.connections.length === 0) {
+      if (options.lease?.mode === "request" && leasePolicy.activeLease) {
+        invalidateManagedLease(options, "CONNECTION_INELIGIBLE");
+      }
+      return options.lease
+        ? {
+            waitingForCapacity: true,
+            retryAfter: leasePolicy.retryAfter,
+            eligibleCount: policyValidLeaseCandidates.length,
+            freeCount: 0,
+          }
+        : null;
+    }
+
+    const orderedConnections = [...leasePolicy.connections].sort((a, b) => {
       if (a.authType !== "oauth" || b.authType !== "oauth") return 0;
       const priorityDelta = (a.priority || 999) - (b.priority || 999);
       if (priorityDelta !== 0) return priorityDelta;
@@ -1560,16 +1702,35 @@ export async function getProviderCredentials(
     const providerOverride = providerStrategyOverrides[resolvedId] || {};
     const strategy = providerOverride.fallbackStrategy || settings.fallbackStrategy || "fill-first";
 
-    let connection;
-    const affinityConnection = await selectSessionAffinityConnection(
-      provider,
-      options.sessionKey,
-      orderedConnections,
-      sessionAffinityTtlMs
-    );
+    let commitSelectionSideEffects: (() => Promise<void> | void) | undefined;
+    let connection = leasePolicy.activeLease
+      ? orderedConnections.find(
+          (candidate) => candidate.id === leasePolicy.activeLease?.connectionId
+        )
+      : undefined;
+    const affinityPlan =
+      options.lease && !connection
+        ? planSessionAffinityConnection(
+            provider,
+            options.sessionKey,
+            orderedConnections,
+            sessionAffinityTtlMs
+          )
+        : null;
+    const affinityConnection = connection
+      ? connection
+      : options.lease
+        ? affinityPlan?.connection
+        : await selectSessionAffinityConnection(
+            provider,
+            options.sessionKey,
+            orderedConnections,
+            sessionAffinityTtlMs
+          );
     if (affinityConnection) {
       connection = affinityConnection;
-      syncSessionAffinityRuntimeFields(connectionsRaw, connection);
+      if (options.lease) commitSelectionSideEffects = affinityPlan?.commit;
+      else syncSessionAffinityRuntimeFields(connectionsRaw, connection);
     } else if (options.sessionKey) {
       log.info(
         "AUTH",
@@ -1611,15 +1772,9 @@ export async function getProviderCredentials(
           );
           // Update lastUsedAt and increment count (await to ensure persistence)
           const nextCount = (connection.consecutiveUseCount || 0) + 1;
-          await touchConnectionLastUsed(connection.id, nextCount);
-          // Sync raw cache row so subsequent calls within TTL see fresh stats
-          for (const r of connectionsRaw as Record<string, unknown>[]) {
-            if (r.id === connection.id) {
-              r.lastUsedAt = new Date().toISOString();
-              r.consecutiveUseCount = nextCount;
-              break;
-            }
-          }
+          const commit = planLastUsedCommit(connection, connectionsRaw, nextCount);
+          if (options.lease) commitSelectionSideEffects = commit;
+          else await commit();
         } else {
           // Pick the least recently used (excluding current if possible)
           // Also penalize accounts with high backoffLevel (previously rate-limited)
@@ -1642,15 +1797,9 @@ export async function getProviderCredentials(
           );
 
           // Update lastUsedAt and reset count to 1 (await to ensure persistence)
-          await touchConnectionLastUsed(connection.id, 1);
-          // Sync raw cache row so subsequent calls within TTL see fresh LRU stats
-          for (const r of connectionsRaw as Record<string, unknown>[]) {
-            if (r.id === connection.id) {
-              r.lastUsedAt = new Date().toISOString();
-              r.consecutiveUseCount = 1;
-              break;
-            }
-          }
+          const commit = planLastUsedCommit(connection, connectionsRaw, 1);
+          if (options.lease) commitSelectionSideEffects = commit;
+          else await commit();
         }
       } else {
         // Fallback scenario: excluded an account due to failure
@@ -1673,18 +1822,12 @@ export async function getProviderCredentials(
         );
 
         // Update lastUsedAt and reset count to 1 (await to ensure persistence)
-        await touchConnectionLastUsed(connection.id, 1);
-        // Sync raw cache row so subsequent calls within TTL see fresh stats
-        for (const r of connectionsRaw as Record<string, unknown>[]) {
-          if (r.id === connection.id) {
-            r.lastUsedAt = new Date().toISOString();
-            r.consecutiveUseCount = 1;
-            break;
-          }
-        }
+        const commit = planLastUsedCommit(connection, connectionsRaw, 1);
+        if (options.lease) commitSelectionSideEffects = commit;
+        else await commit();
       }
     } else if (strategy === "p2c") {
-      const candidatePool = withQuota.length > 0 ? withQuota : orderedConnections;
+      const candidatePool = orderedConnections;
       // Power of Two Choices: sample from the quota-eligible pool and compare
       // health instead of defaulting to random-first selection.
       if (candidatePool.length <= 2) {
@@ -1726,8 +1869,15 @@ export async function getProviderCredentials(
     } else if (strategy === "strict-random") {
       // Strict Random: shuffle deck — uses each account once before reshuffling
       const ids = orderedConnections.map((c) => c.id);
-      const selectedId = getNextFromDeckSync(`conn:${provider}`, ids);
-      connection = orderedConnections.find((c) => c.id === selectedId) || orderedConnections[0];
+      if (options.lease) {
+        const plan = planNextFromDeckSync(`conn:${provider}`, ids);
+        connection =
+          orderedConnections.find((c) => c.id === plan.selectedId) || orderedConnections[0];
+        commitSelectionSideEffects = plan.commit;
+      } else {
+        const selectedId = getNextFromDeckSync(`conn:${provider}`, ids);
+        connection = orderedConnections.find((c) => c.id === selectedId) || orderedConnections[0];
+      }
     } else {
       // Default: fill-first (already sorted by priority in getProviderConnections)
       connection = orderedConnections[0];
@@ -1753,6 +1903,43 @@ export async function getProviderCredentials(
       if (moreAvailablePeer) connection = moreAvailablePeer;
     }
 
+    let exclusiveLease: ExclusiveConnectionLease | undefined;
+    if (options.lease) {
+      const candidateIds = orderedConnections.map((candidate) => candidate.id);
+      const selectNextLeaseCandidate = (excludedConnectionId: string) =>
+        getProviderCredentials(provider, null, allowedConnections, requestedModel, {
+          ...options,
+          excludeConnectionIds: [...excludedConnectionIds, excludedConnectionId],
+          deferLeaseClaim: true,
+          _leaseCandidateIds: candidateIds,
+        });
+      if (options.deferLeaseClaim) {
+        return materializeConnection(connection, options, {
+          commitSelectionSideEffects,
+          selectNextLeaseCandidate,
+        });
+      }
+      let claim = mutateExclusiveConnectionLease(
+        connection,
+        leasePolicy.activeLease,
+        options.lease
+      );
+      if (claim.kind === "LOST") {
+        return getProviderCredentials(provider, null, allowedConnections, requestedModel, {
+          ...options,
+          excludeConnectionIds: [...excludedConnectionIds, connection.id],
+          _leaseCandidateIds: candidateIds,
+          _leaseRetryWithLockHeld: true,
+        });
+      }
+      if (claim.kind === "STALE") return { leaseFenceStale: true };
+      exclusiveLease = claim.lease;
+      await commitSelectionSideEffects?.();
+      if (options.materializeCredentials === false) {
+        return { exclusiveLease, connectionId: connection.id, provider: connection.provider };
+      }
+    }
+
     if (provider === "antigravity" && connection) {
       log.info(
         "AUTH",
@@ -1760,57 +1947,9 @@ export async function getProviderCredentials(
       );
     }
 
-    const apiKeyHealth = connection.providerSpecificData?.apiKeyHealth as
-      Record<string, KeyHealth> | undefined;
-    if (apiKeyHealth) {
-      syncHealthFromDB(connection.id, apiKeyHealth);
-    }
-
-    const releaseOAuthSession =
-      options.reserveOAuthSession === true && connection.authType === "oauth" && options.sessionKey
-        ? reserveOAuthSession(connection.id, options.sessionKey)
-        : undefined;
-
-    return {
-      apiKey: connection.apiKey,
-      accessToken: connection.accessToken,
-      refreshToken: connection.refreshToken,
-      expiresAt: connection.tokenExpiresAt || connection.expiresAt || null,
-      projectId: connection.projectId,
-      // #474: surface the connection's configured defaultModel so the chat /
-      // embeddings handlers can resolve a bare model name (e.g. an alias that
-      // resolved to "auto") to a real provider model ID before the upstream call.
-      defaultModel: connection.defaultModel || null,
-      copilotToken:
-        typeof connection.providerSpecificData.copilotToken === "string"
-          ? connection.providerSpecificData.copilotToken
-          : null,
-      providerSpecificData: connection.providerSpecificData,
-      // Fields the generic quota fetcher (open-sse/services/genericQuotaFetcher.ts)
-      // needs to delegate to getUsageForProvider for any provider — kept aliased
-      // (`id` + `connectionId`) for back-compat with callers that already use the
-      // connectionId name.
-      id: connection.id,
-      provider: connection.provider,
-      authType: connection.authType,
-      email: connection.email,
-      connectionId: connection.id,
-      // Include current status for optimization check
-      testStatus: connection.testStatus,
-      lastError: connection.lastError,
-      lastErrorType: connection.lastErrorType,
-      lastErrorSource: connection.lastErrorSource,
-      errorCode: connection.errorCode,
-      rateLimitedUntil: connection.rateLimitedUntil,
-      maxConcurrent: connection.maxConcurrent,
-      // Surface per-window quota overrides so the preflight latency gate in
-      // getProviderCredentialsWithQuotaPreflight can see them. Without this,
-      // user-set cutoffs would silently never enforce.
-      quotaWindowThresholds: connection.quotaWindowThresholds ?? null,
-      ...(releaseOAuthSession ? { releaseOAuthSession } : {}),
-    };
+    return materializeConnection(connection, options, { exclusiveLease });
   } finally {
-    selectionLock.release();
+    selectionLock?.release();
   }
 }
 export async function getProviderCredentialsWithQuotaPreflight(
@@ -1861,18 +2000,17 @@ export async function getProviderCredentialsWithQuotaPreflight(
   // tighter floor is honored.
   const FACTORY_NO_OP_REMAINING_PERCENT = 2;
   const globalDefaultIsRestrictive = defaultThresholdPercent > FACTORY_NO_OP_REMAINING_PERCENT;
+  let pendingCredentialSelection: Awaited<ReturnType<typeof getProviderCredentials>> | undefined;
 
   while (true) {
-    const credentials = await getProviderCredentials(
-      provider,
-      null,
-      allowedConnections,
-      requestedModel,
-      {
+    const credentials =
+      pendingCredentialSelection ??
+      (await getProviderCredentials(provider, null, allowedConnections, requestedModel, {
         ...options,
         excludeConnectionIds: Array.from(excludedConnectionIds),
-      }
-    );
+        ...(options.lease ? { deferLeaseClaim: true } : {}),
+      }));
+    pendingCredentialSelection = undefined;
 
     if (!credentials) {
       if (blockedByPreflight.length > 0) {
@@ -1895,14 +2033,42 @@ export async function getProviderCredentialsWithQuotaPreflight(
       return credentials;
     }
 
-    const selectedCredentials = credentials as typeof credentials & {
+    const selectedCredentials = credentials as Omit<
+      typeof credentials,
+      "selectNextLeaseCandidate"
+    > & {
       connectionId?: string;
+      commitSelectionSideEffects?: () => Promise<void> | void;
+      selectNextLeaseCandidate?: (excludedConnectionId: string) => Promise<typeof credentials>;
       releaseOAuthSession?: () => void;
     };
     const connectionId = selectedCredentials.connectionId;
     if (!connectionId) {
       return credentials;
     }
+    const commitLease = async () => {
+      if (!options.lease) return credentials;
+      const activeLease = getActiveExclusiveConnectionLease(options.lease.context.leaseOwnerId);
+      const claim = mutateExclusiveConnectionLease(
+        selectedCredentials as unknown as ProviderConnectionView,
+        activeLease,
+        options.lease
+      );
+      if (claim.kind === "LOST") {
+        selectedCredentials.releaseOAuthSession?.();
+        excludedConnectionIds.add(connectionId);
+        pendingCredentialSelection =
+          await selectedCredentials.selectNextLeaseCandidate?.(connectionId);
+        return null;
+      }
+      if (claim.kind === "STALE") return { leaseFenceStale: true };
+      await selectedCredentials.commitSelectionSideEffects?.();
+      if (options.materializeCredentials === false) {
+        selectedCredentials.releaseOAuthSession?.();
+        return { exclusiveLease: claim.lease, connectionId, provider };
+      }
+      return { ...credentials, exclusiveLease: claim.lease };
+    };
 
     // Cascading resolver: per-connection override → per-(provider, window)
     // default → global default. Used per-window when the fetcher exposes
@@ -1932,7 +2098,11 @@ export async function getProviderCredentialsWithQuotaPreflight(
     const legacyForceDisable =
       (credentials as { providerSpecificData?: Record<string, unknown> }).providerSpecificData
         ?.quotaPreflightEnabled === false;
-    if (legacyForceDisable) return credentials;
+    if (legacyForceDisable) {
+      const committed = await commitLease();
+      if (committed === null) continue;
+      return committed;
+    }
 
     const hasConnectionOverrides = Object.keys(perConnectionWindowOverrides).length > 0;
     const legacyForceEnable = isQuotaPreflightEnabled(credentials);
@@ -1942,7 +2112,9 @@ export async function getProviderCredentialsWithQuotaPreflight(
       !legacyForceEnable &&
       !globalDefaultIsRestrictive
     ) {
-      return credentials;
+      const committed = await commitLease();
+      if (committed === null) continue;
+      return committed;
     }
 
     // Returns the minimum-remaining cutoff for a window — matches the
@@ -1980,7 +2152,9 @@ export async function getProviderCredentialsWithQuotaPreflight(
       throw error;
     }
     if (preflight.proceed) {
-      return credentials;
+      const committed = await commitLease();
+      if (committed === null) continue;
+      return committed;
     }
 
     selectedCredentials.releaseOAuthSession?.();
@@ -1997,6 +2171,7 @@ export async function getProviderCredentialsWithQuotaPreflight(
       resetAt: unavailableUntil,
     });
     excludedConnectionIds.add(connectionId);
+    pendingCredentialSelection = await selectedCredentials.selectNextLeaseCandidate?.(connectionId);
 
     log.info(
       "AUTH",

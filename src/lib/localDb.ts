@@ -112,6 +112,7 @@ export {
   pickApiKeyForInternalUse,
   clearApiKeyCaches,
   resetApiKeyState,
+  ApiKeyPolicyInvariantError,
 } from "./db/apiKeys";
 
 export {
@@ -173,6 +174,8 @@ export {
 } from "./db/databaseSettings";
 
 export type { UserDatabaseSettings } from "./db/databaseSettings";
+
+export * from "./db/exclusiveConnectionLeases";
 
 export {
   // Proxy Registry
