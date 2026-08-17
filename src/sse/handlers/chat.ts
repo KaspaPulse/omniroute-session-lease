@@ -32,8 +32,12 @@ import { getImageModelEntry } from "@omniroute/open-sse/config/imageRegistry.ts"
 import { acceptHeaderForcesStream } from "@omniroute/open-sse/utils/aiSdkCompat.ts";
 import { applyNoThinkingAlias } from "@omniroute/open-sse/utils/noThinkingAlias.ts";
 import { resolveCcDiscoveryAliasStrip } from "@/lib/ccDiscoveryAliasResolve";
-import { handleComboChat, shouldSkipConnDisable } from "@omniroute/open-sse/services/combo.ts";
-import type { SingleModelTarget } from "@omniroute/open-sse/services/combo/types.ts";
+import {
+  handleComboChat,
+  resolveComboTargets,
+  shouldSkipConnDisable,
+} from "@omniroute/open-sse/services/combo.ts";
+import type { ComboLike, SingleModelTarget } from "@omniroute/open-sse/services/combo/types.ts";
 import { mergeAbortSignals } from "@omniroute/open-sse/executors/base.ts";
 import { resolveRequestAutoControls } from "@omniroute/open-sse/services/autoCombo/requestControls.ts";
 import { isVerifiedNativeCodexRequest } from "@omniroute/open-sse/config/codexIdentity.ts";
@@ -169,6 +173,16 @@ import {
 } from "../services/cooldownAwareRetry";
 import { constrainConnectionsToQuota, resolveQuotaKeyScope } from "../../lib/quota/quotaKey";
 import { checkConnectionCapacity } from "../utils/backpressure";
+import {
+  buildManagedLeaseErrorResponse,
+  buildManagedLeaseSelectionErrorResponse,
+  credentialLease,
+  isExclusiveLeaseManagedKey,
+  LeaseContextError,
+  parseManagedLeaseRequestContext,
+  validateExclusiveLeaseKeyConfiguration,
+  type ManagedLeaseDispatchContext,
+} from "../services/leaseContext";
 
 registerCodexQuotaFetcher();
 
@@ -209,12 +223,12 @@ registerGrokWebQuotaFetcher();
 // what lets the per-window cutoff modal in Dashboard › Limits actually
 // enforce thresholds for Claude / GLM / Cursor / etc., not just Codex.
 registerGenericQuotaFetchers();
-let combosCachePromise: Promise<unknown[]> | null = null;
+let combosCachePromise: Promise<ComboLike[]> | null = null;
 let combosCacheTs = 0;
 let combosCacheVersionSnapshot = -1;
 const COMBOS_CACHE_TTL_MS = 10_000;
 
-async function getCombosCachedForChat(): Promise<unknown[]> {
+async function getCombosCachedForChat(): Promise<ComboLike[]> {
   const now = Date.now();
   // Explicit non-null check: we intentionally cache and return the Promise
   // itself (to dedupe concurrent callers), so this is not a forgotten await.
@@ -231,7 +245,7 @@ async function getCombosCachedForChat(): Promise<unknown[]> {
 
   combosCacheTs = now;
   combosCacheVersionSnapshot = getCombosCacheVersion();
-  combosCachePromise = getCombos().catch(() => []);
+  combosCachePromise = getCombos().catch(() => []) as Promise<ComboLike[]>;
   return combosCachePromise;
 }
 
@@ -253,6 +267,44 @@ function intersectAllowedConnectionIds(primary: unknown, secondary: unknown): st
 
   return first || second || null;
 }
+
+function isManagedComboUnsupported(
+  combo: ComboLike,
+  settings: Record<string, unknown>,
+  allCombos: ComboLike[],
+  visited = new Set<string>()
+): boolean {
+  if (visited.has(combo.name)) return false;
+  visited.add(combo.name);
+  const strategy = combo.strategy ?? "priority";
+  const config = resolveComboConfig(combo, settings) as Record<string, unknown>;
+  const resolvedTargets = resolveComboTargets(combo, allCombos);
+  const pipeline =
+    strategy === "pipeline" ||
+    (strategy === "auto" && (config.pipeline_enabled === true || combo.name === "auto/smart"));
+  const nestedUnsafe = (combo.models as Array<{ kind?: string; comboName?: string }>).some(
+    (step) => {
+      if (step?.kind !== "combo-ref" || !step.comboName) return false;
+      const nested = allCombos.find((candidate) => candidate.name === step.comboName);
+      return Boolean(nested && isManagedComboUnsupported(nested, settings, allCombos, visited));
+    }
+  );
+  return (
+    strategy === "fusion" ||
+    strategy === "context-relay" ||
+    (config.chaos as { enabled?: boolean } | undefined)?.enabled === true ||
+    (config.shadowRouting as { enabled?: boolean } | undefined)?.enabled === true ||
+    (config.zeroLatencyOptimizationsEnabled === true && config.hedging === true) ||
+    (resolvedTargets.length > 1 &&
+      (pipeline || resolvedTargets.some((target) => Boolean(target.connectionId?.trim())))) ||
+    nestedUnsafe
+  );
+}
+
+const managedComboRejection = () =>
+  buildManagedLeaseErrorResponse(
+    new LeaseContextError(409, "LEASE_UNSUPPORTED_ROUTE", "Managed leases do not support this route")
+  );
 
 const comboPromoteDeps = { updateCombo, info: log.info, warn: log.warn };
 
@@ -518,6 +570,19 @@ async function handleChatImplementation(
     return policy.rejection;
   }
   const apiKeyInfo = policy.apiKeyInfo;
+  let managedLease: ManagedLeaseDispatchContext | null = null;
+  if (isExclusiveLeaseManagedKey(apiKeyInfo)) {
+    try {
+      validateExclusiveLeaseKeyConfiguration(apiKeyInfo);
+      managedLease = {
+        apiKeyId: apiKeyInfo!.id,
+        context: parseManagedLeaseRequestContext(request.headers),
+      };
+    } catch (error) {
+      if (error instanceof LeaseContextError) return buildManagedLeaseErrorResponse(error);
+      throw error;
+    }
+  }
   const bypassProviderQuotaPolicy = hasProviderQuotaBypassScope(apiKeyInfo?.scopes);
   telemetry.endPhase();
 
@@ -771,6 +836,12 @@ async function handleChatImplementation(
       if (filtered instanceof Response) return filtered;
       combo = filtered;
     }
+    const [settings, allCombos] = await Promise.all([
+      getCachedSettings().catch(() => ({})),
+      getCombosCachedForChat(),
+    ]);
+    if (managedLease && isManagedComboUnsupported(combo, settings, allCombos))
+      return managedComboRejection();
     log.info(
       "CHAT",
       `Combo "${modelStr}" [${combo.strategy || "priority"}] with ${combo.models.length} models`
@@ -857,24 +928,25 @@ async function handleChatImplementation(
           ...(target?.allowRateLimitedConnection ? { allowRateLimitedConnections: true } : {}),
           ...(target?.connectionId ? { forcedConnectionId: target.connectionId } : {}),
           ...(bypassProviderQuotaPolicy ? { bypassQuotaPolicy: true } : {}),
+          ...(managedLease ? { lease: credentialLease(managedLease) } : {}),
         }
       );
-      if (!creds || !("authType" in creds)) return false;
+      if (
+        !creds ||
+        ("allRateLimited" in creds && creds.allRateLimited) ||
+        ("waitingForCapacity" in creds && creds.waitingForCapacity)
+      )
+        return false;
 
       // OAuth selection must happen atomically with occupancy reservation in the
       // actual dispatch. Availability preflight may finish well before a combo
       // target runs, so caching OAuth credentials here would reintroduce a race.
-      if (creds.authType !== "oauth") {
+      if ("authType" in creds && creds.authType !== "oauth") {
         comboPreselectedCredentials.set(getComboCredentialCacheKey(modelString, target), creds);
       }
       return true;
     };
 
-    // Fetch settings and all combos for config cascade and nested resolution
-    const [settings, allCombos] = await Promise.all([
-      getCachedSettings().catch(() => ({})),
-      getCombosCachedForChat(),
-    ]);
     const relayConfig =
       combo.strategy === "context-relay" ? resolveComboConfig(combo, settings) : null;
     // Per-request Auto-Combo controls (#6023 / #6024 / #6025 / #3470): steer an
@@ -943,6 +1015,7 @@ async function handleChatImplementation(
             reasoningDecision,
             reasoningIntent,
             reasoningRequestTags: requestRoutingTags.tags,
+            managedLease,
             // #7360 follow-up: without this, a target dispatch abandoned by
             // targetTimeoutRunner.ts's per-target timeout (comboTargetTimeoutMs)
             // never learns it was abandoned — it only watches the ORIGINAL
@@ -1009,6 +1082,7 @@ async function handleChatImplementation(
             sessionAffinityKey,
             emergencyFallbackTried: true,
             forceLiveComboTest: isComboLiveTest,
+            managedLease,
           },
           combo.strategy,
           true
@@ -1096,6 +1170,7 @@ async function handleChatImplementation(
       reasoningDecision,
       reasoningIntent,
       reasoningRequestTags: requestRoutingTags.tags,
+      managedLease,
     },
     null,
     false
@@ -1138,6 +1213,7 @@ async function handleSingleModelChat(
     reasoningDecision?: ReasoningRuleDecision | null;
     reasoningIntent?: ExtractedReasoningIntent | null;
     reasoningRequestTags?: string[];
+    managedLease?: ManagedLeaseDispatchContext | null;
     /**
      * Per-target abort signal from combo.ts's targetTimeoutRunner
      * (comboTargetTimeoutMs) — see the #7360 follow-up comment at the
@@ -1163,6 +1239,7 @@ async function handleSingleModelChat(
   // resolveModelOrError found a combo but the main handler's combo lookup missed it.
   if ((resolved as any).combo) {
     const redirectCombo = (resolved as any).combo;
+    if (runtimeOptions.managedLease) return managedComboRejection();
     log.info(
       "ROUTING",
       `Safety-net combo redirect for "${modelStr}" → combo="${redirectCombo.name}"`
@@ -1199,6 +1276,7 @@ async function handleSingleModelChat(
             allowRateLimitedConnection: resolvedTarget?.allowRateLimitedConnection === true,
             providerId: resolvedTarget?.providerId ?? null,
             correlationId: runtimeOptions?.correlationId ?? null,
+            managedLease: runtimeOptions.managedLease ?? null,
             // #7360 follow-up — see the primary handleSingleModel closure above.
             modelAbortSignal: target?.modelAbortSignal ?? null,
           },
@@ -1397,6 +1475,9 @@ async function handleSingleModelChat(
                 ...(!forceLiveComboTest && bypassProviderQuotaPolicy
                   ? { bypassQuotaPolicy: true }
                   : {}),
+                ...(runtimeOptions.managedLease
+                  ? { lease: credentialLease(runtimeOptions.managedLease) }
+                  : {}),
                 ...(() => {
                   const effectiveForcedId = resolveForcedConnectionForCredentialPool({
                     forcedConnectionId: runtimeOptions.forcedConnectionId ?? null,
@@ -1413,6 +1494,11 @@ async function handleSingleModelChat(
               }
             );
       preselectedCredentials = null;
+
+      if (runtimeOptions.managedLease && credentials) {
+        const leaseError = buildManagedLeaseSelectionErrorResponse(credentials);
+        if (leaseError) return leaseError;
+      }
 
       // #9467: also treat the auth layer's allExpired verdict as a no-credentials
       // outcome (auth.ts produces it; without this check an all-expired pool fell
@@ -1613,7 +1699,7 @@ async function handleSingleModelChat(
             proxyInfo,
             appliedProxySink,
             log,
-            clientRawRequest,
+            clientRawRequest: dispatchClientRawRequest,
             credentials,
             apiKeyInfo,
             userAgent,
@@ -1632,6 +1718,7 @@ async function handleSingleModelChat(
             modelPinned: runtimeOptions?.modelPinned ?? false,
             routingComboId: runtimeOptions?.routingComboId ?? null,
             sessionAffinityKey: runtimeOptions.sessionAffinityKey ?? null,
+            managedLease: runtimeOptions.managedLease ?? null,
           },
           runtimeOptions
         );
@@ -1683,6 +1770,16 @@ async function handleSingleModelChat(
           return wrapResponseWithOAuthSessionRelease(result.response, releaseOAuthSession);
         }
         releaseOAuthSession();
+        return result.response;
+      }
+
+      // A final hard-lease fence rejection is authoritative. It must never mutate
+      // connection health/cooldown state or fall through to ordinary account/model
+      // fallback, which could turn a stale lifecycle into unmanaged dispatch.
+      if (
+        runtimeOptions.managedLease &&
+        (result.errorType === "lease_error" || String(result.errorCode || "").startsWith("LEASE_"))
+      ) {
         return result.response;
       }
 
