@@ -441,7 +441,7 @@
     "@babel/core": "^7.29.6",
     "hono": "^4.12.34",
     "@hono/node-server": "^2.0.5",
-    "fast-uri": "^3.1.5",
+    "fast-uri": "^3.1.7",
     "body-parser": "^2.3.0",
     "@yarnpkg/parsers": {
       "js-yaml": "^4.3.1"
