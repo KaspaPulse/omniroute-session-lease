@@ -396,7 +396,7 @@
     "type-coverage": "^2.29.7",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.59.4",
-    "vitest": "^4.1.7",
+    "vitest": "^4.1.11",
     "wait-on": "^9.0.10",
     "wtfnode": "^0.10.1"
   },
