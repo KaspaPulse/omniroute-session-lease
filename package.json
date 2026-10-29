@@ -390,7 +390,7 @@
     "opencode-ai": "1.18.8",
     "playwright-ctrf-json-reporter": "^0.0.29",
     "prettier": "^3.8.3",
-    "promptfoo": "^0.121.18",
+    "promptfoo": "^0.125.1",
     "size-limit": "^12.1.0",
     "tailwindcss": "^4.3.0",
     "type-coverage": "^2.29.7",
