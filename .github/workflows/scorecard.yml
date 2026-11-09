@@ -3,9 +3,6 @@ on:
   branch_protection_rule:
   schedule:
     - cron: "27 7 * * 1"
-  push:
-    branches: ["main"]
-
 permissions: read-all
 
 jobs:
